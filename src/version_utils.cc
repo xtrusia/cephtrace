@@ -452,8 +452,20 @@ std::string find_mapped_library_path(int pid, const std::string& lib_name) {
         return "";
     }
     
-    // CRITICAL: Check if the path from maps is accessible from the host
-    // If not, we need to use /proc/<pid>/root prefix for uprobe to work
+    // CRITICAL: Resolve symlinks to get the actual path
+    // Snap uses symlinks like "current" -> "1582", but we need the real path
+    std::clog << "Resolving symlinks for: " << maps_result << std::endl;
+    
+    char real_path[4096];
+    if (realpath(maps_result.c_str(), real_path) != NULL) {
+        std::string resolved_path(real_path);
+        std::clog << "  Resolved to: " << resolved_path << std::endl;
+        maps_result = resolved_path;
+    } else {
+        std::clog << "  Could not resolve symlink, using original path" << std::endl;
+    }
+    
+    // Check if the path from maps is accessible from the host
     std::clog << "Checking if path is accessible from host: " << maps_result << std::endl;
     
     if (access(maps_result.c_str(), R_OK) == 0) {
@@ -500,6 +512,8 @@ std::string find_mapped_library_path(int pid, const std::string& lib_name) {
         std::cerr << "ERROR: Could not find accessible path for " << lib_name << std::endl;
         std::cerr << "Path from maps: " << maps_result << std::endl;
         std::cerr << "This path is inside the container/snap but not accessible from host" << std::endl;
+    } else {
+        std::clog << "Final selected path: " << result << std::endl;
     }
     
     return result;
