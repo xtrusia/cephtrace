@@ -1147,27 +1147,43 @@ int attach_uprobe(struct osdtrace_bpf *skel,
                  std::string funcname,
                  int v = 0) {
 
-  std::string pid_path = path;
-  if (process_id != -1) {
-    pid_path = "/proc/" + std::to_string(process_id) + "/root/" + path;
-  }
+  // For container/namespace support: always use the original binary path
+  // and let the kernel handle inode resolution across all processes
+  // This fixes the inode mismatch issue in containerized environments
+  std::string binary_path = path;
+  
+  // When process_id is specified, we still use -1 for uprobe attachment
+  // to ensure the probe works across namespace boundaries
+  // The kernel will attach based on binary inode, not namespace-specific paths
+  int attach_pid = -1;
 
   auto &func2pc = dp.mod_func2pc[path];
   size_t func_addr = func2pc[funcname];
+  
+  clog << "Attaching uprobe: function=" << funcname << " path=" << binary_path 
+       << " offset=0x" << std::hex << func_addr << std::dec << endl;
+  
   if (v > 0)
       funcname = funcname + "_v" + std::to_string(v); 
   int pid = func_progid[funcname];
   struct bpf_link *ulink = bpf_program__attach_uprobe(
       *skel->skeleton->progs[pid].prog,
       false /* not uretprobe */,
-      process_id,
-      pid_path.c_str(), func_addr);
+      attach_pid,
+      binary_path.c_str(), func_addr);
   if (!ulink) {
-    cerr << "Failed to attach uprobe to " << funcname << endl;
+    cerr << "Failed to attach uprobe to " << funcname << " at " << binary_path 
+         << " offset 0x" << std::hex << func_addr << std::dec
+         << " error: " << strerror(errno) << endl;
     return -errno;
   }
 
-  clog << "uprobe " << funcname <<  " attached" << endl;
+  if (process_id > 0) {
+    clog << "✓ uprobe " << funcname << " attached (will trace process " << process_id 
+         << " and all other processes using this binary)" << endl;
+  } else {
+    clog << "✓ uprobe " << funcname << " attached to all processes" << endl;
+  }
   return 0;
 }
 
@@ -1176,6 +1192,10 @@ int attach_retuprobe(struct osdtrace_bpf *skel,
 	           std::string path,
 		   std::string funcname,
 		   int v = 0) {
+  // For container/namespace support: always use -1 for pid
+  // to ensure the probe works across namespace boundaries
+  int attach_pid = -1;
+  
   auto &func2pc = dp.mod_func2pc[path];
   size_t func_addr = func2pc[funcname];
   if (v > 0)
@@ -1184,7 +1204,7 @@ int attach_retuprobe(struct osdtrace_bpf *skel,
   struct bpf_link *ulink = bpf_program__attach_uprobe(
       *skel->skeleton->progs[pid].prog, 
       true /* uretprobe */,
-      process_id,
+      attach_pid,
       path.c_str(), func_addr);
   if (!ulink) {
     cerr << "Failed to attach uretprobe to " << funcname << endl;
@@ -1227,30 +1247,37 @@ int main(int argc, char **argv) {
   std::string osd_path;
 
   if (process_id != -1) {
-    // PID specified - read executable path from /proc/<pid>/exe
-    std::string exe_link = "/proc/" + std::to_string(process_id) + "/exe";
-    char exe_path[PATH_MAX];
-    ssize_t len = readlink(exe_link.c_str(), exe_path, sizeof(exe_path) - 1);
+    // PID specified - use the actual mapped executable path for correct inode
+    // This is critical for containerized/namespace environments
+    osd_path = find_mapped_library_path(process_id, "ceph-osd");
+    
+    if (osd_path.empty()) {
+      // Fallback: try reading from /proc/<pid>/exe
+      std::string exe_link = "/proc/" + std::to_string(process_id) + "/exe";
+      char exe_path[PATH_MAX];
+      ssize_t len = readlink(exe_link.c_str(), exe_path, sizeof(exe_path) - 1);
 
-    if (len != -1) {
-      exe_path[len] = '\0';
-      std::string target(exe_path);
-      // Remove "(deleted)" suffix if present
-      size_t deleted_pos = target.find(" (deleted)");
-      if (deleted_pos != std::string::npos) {
-        target = target.substr(0, deleted_pos);
-      }
-      osd_path = target;
-      clog << "Reading executable from process " << process_id << ": " << osd_path << endl;
-
-      // Validate that the process is actually running ceph-osd
-      if (osd_path.find("ceph-osd") == std::string::npos) {
-        std::cerr << "Error: Process ID " << process_id << " is not running ceph-osd" << std::endl;
-        std::cerr << "Process is running: " << osd_path << std::endl;
+      if (len != -1) {
+        exe_path[len] = '\0';
+        std::string target(exe_path);
+        // Remove "(deleted)" suffix if present
+        size_t deleted_pos = target.find(" (deleted)");
+        if (deleted_pos != std::string::npos) {
+          target = target.substr(0, deleted_pos);
+        }
+        osd_path = target;
+      } else {
+        std::cerr << "Error: Could not read /proc/" << process_id << "/exe" << std::endl;
         return 1;
       }
-    } else {
-      std::cerr << "Error: Could not read /proc/" << process_id << "/exe" << std::endl;
+    }
+    
+    clog << "Using mapped executable path for containerized process " << process_id << ": " << osd_path << endl;
+
+    // Validate that the process is actually running ceph-osd
+    if (osd_path.find("ceph-osd") == std::string::npos) {
+      std::cerr << "Error: Process ID " << process_id << " is not running ceph-osd" << std::endl;
+      std::cerr << "Process is running: " << osd_path << std::endl;
       return 1;
     }
   } else {

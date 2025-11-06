@@ -372,6 +372,86 @@ std::string find_executable_path(const std::string& exe_name) {
 
     return "";
 }
+
+std::string find_mapped_library_path(int pid, const std::string& lib_name) {
+    if (pid == -1) {
+        std::cerr << "Error: find_mapped_library_path requires a valid PID" << std::endl;
+        return "";
+    }
+
+    // Read /proc/<pid>/maps to find the actual mapped library
+    std::string maps_path = "/proc/" + std::to_string(pid) + "/maps";
+    std::ifstream maps_file(maps_path);
+    
+    if (!maps_file.is_open()) {
+        std::cerr << "Error: Could not open " << maps_path << std::endl;
+        return "";
+    }
+
+    std::string line;
+    std::string result;
+    bool found_lib = false;
+    
+    std::clog << "Searching for '" << lib_name << "' in " << maps_path << std::endl;
+    
+    while (std::getline(maps_file, line)) {
+        // Look for lines containing the library name
+        if (line.find(lib_name) != std::string::npos) {
+            found_lib = true;
+            std::clog << "  Found matching line: " << line << std::endl;
+            
+            // Extract the file path (last field in the line after multiple spaces)
+            // Format: address-address perms offset dev:inode pathname
+            size_t path_start = line.find_last_of(' ');
+            if (path_start != std::string::npos) {
+                std::string path = line.substr(path_start + 1);
+                // Remove any trailing whitespace
+                path.erase(path.find_last_not_of(" \n\r\t") + 1);
+                
+                std::clog << "  Extracted path: '" << path << "'" << std::endl;
+                
+                // Skip if it's marked as deleted or anonymous
+                if (path.find("(deleted)") == std::string::npos && 
+                    path.find("[") == std::string::npos &&
+                    !path.empty() && path[0] == '/') {
+                    
+                    // For executable files, prefer the one with 'x' permission
+                    if (lib_name.find(".so") == std::string::npos) {
+                        // This is an executable, check for 'x' permission
+                        if (line.find("r-xp") != std::string::npos || 
+                            line.find("r-x") != std::string::npos) {
+                            result = path;
+                            std::clog << "Found mapped executable " << lib_name << " at: " << result 
+                                      << " in process " << pid << std::endl;
+                            break;
+                        }
+                    } else {
+                        // This is a library
+                        result = path;
+                        std::clog << "Found mapped library " << lib_name << " at: " << result 
+                                  << " in process " << pid << std::endl;
+                        break;
+                    }
+                } else {
+                    std::clog << "  Skipped (deleted or anonymous)" << std::endl;
+                }
+            }
+        }
+    }
+    
+    maps_file.close();
+    
+    if (result.empty()) {
+        if (found_lib) {
+            std::cerr << "Warning: Found " << lib_name << " in maps but all entries were deleted or anonymous" << std::endl;
+        } else {
+            std::cerr << "Warning: Could not find " << lib_name << " in /proc/" << pid << "/maps" << std::endl;
+            std::cerr << "Try running: grep " << lib_name << " /proc/" << pid << "/maps" << std::endl;
+        }
+    }
+    
+    return result;
+}
 bool check_process_executable_deleted(int pid, const std::string& exe_name) {
     // Check /proc/PID/exe symlink
     std::string exe_path = "/proc/" + std::to_string(pid) + "/exe";

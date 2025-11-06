@@ -356,3 +356,146 @@ All latencies are measured in **microseconds (μs)** or **milliseconds (ms)** de
 
 ## Kernel Requirements
 - The minimum kernel version required is v5.8
+
+## Troubleshooting
+
+### No Events Received
+
+If you're not receiving any events despite the probes being attached, try these debugging steps:
+
+#### Quick Diagnosis Tool
+
+We provide a diagnostic script to quickly identify issues:
+
+```bash
+sudo ./tools/diagnose_uprobe.sh <PID> [binary_name]
+
+# Example for OSD process
+sudo ./tools/diagnose_uprobe.sh 12345 ceph-osd
+
+# Example for client process  
+sudo ./tools/diagnose_uprobe.sh 67890 librados
+```
+
+This will check:
+- Process existence and command line
+- Memory mappings and actual binary paths
+- Namespace information (container detection)
+- Current uprobe registrations
+- BPF program status
+- Provide specific recommendations
+
+#### Manual Debugging Steps
+
+#### 1. Verify BPF Program Execution
+Check if BPF programs are being triggered:
+```bash
+# In one terminal, run:
+sudo cat /sys/kernel/debug/tracing/trace_pipe
+
+# In another terminal, run your trace tool
+sudo ./osdtrace -x ...
+```
+
+You should see `bpf_printk` messages like "Entered into uprobe_*" when functions are called.
+
+#### 2. Check Uprobe Registration
+Verify that uprobes are actually registered:
+```bash
+sudo cat /sys/kernel/debug/tracing/uprobe_events
+```
+
+You should see entries for your attached probes.
+
+#### 3. Verify Library/Binary Paths
+For containerized processes (microceph, snap, etc.), verify the correct paths are being used:
+```bash
+# Check what libraries/binaries the process is actually using
+sudo cat /proc/<PID>/maps | grep -E '(ceph-osd|librados|librbd)'
+
+# Compare with what the trace tool reports
+```
+
+The paths should match exactly. If they don't, the inode won't match and events won't be captured.
+
+#### 4. Check for Multiple Binary Versions
+```bash
+# See if process is using a different binary than on the host filesystem
+sudo ls -li /usr/bin/ceph-osd  # inode on host
+sudo ls -li /proc/<PID>/root/usr/bin/ceph-osd  # inode in container
+
+# Check what's actually mapped in memory
+sudo readlink /proc/<PID>/exe
+```
+
+#### 5. Verify Process Activity
+Make sure the process is actually performing operations:
+```bash
+# For OSD: generate some I/O
+rados bench -p test 10 write
+
+# For client: perform some operations
+rbd bench --io-type write <pool>/<image>
+```
+
+#### 6. Permission Issues
+Ensure you're running with sufficient privileges:
+```bash
+# Check capabilities
+sudo getcap ./osdtrace
+sudo getcap ./radostrace
+
+# Run with all capabilities if needed
+sudo -E ./osdtrace ...
+```
+
+#### 7. Namespace Issues (Containers/microceph)
+
+For containerized environments, the key is using the ACTUAL file path that the kernel sees:
+
+```bash
+# Find the real process
+ps aux | grep ceph-osd
+
+# Check its memory mappings
+sudo cat /proc/<PID>/maps | grep ceph-osd
+
+# The path shown in maps is what you need to use for uprobe
+# Our tool should automatically detect this with -p <PID>
+```
+
+**Common Issues:**
+- **Snap-based installs (microceph)**: Binary is at `/snap/microceph/current/usr/bin/ceph-osd`
+- **Container-based**: Binary might be at `/var/lib/containers/.../usr/bin/ceph-osd`
+- **Different versions**: Host has one version, container runs another
+
+**Solution:**
+Always use `-p <PID>` option for containerized processes:
+```bash
+sudo ./osdtrace -i osd_dwarf.json -p <PID> -x --skip-version-check
+```
+
+The tool will automatically:
+1. Read `/proc/<PID>/maps` to find the ACTUAL binary path
+2. Use that path for uprobe attachment
+3. Ensure inode matching across namespaces
+
+#### 8. Enable Verbose Logging
+
+The tool now outputs detailed information about:
+- Which paths are being searched
+- What was found in `/proc/<PID>/maps`
+- The exact binary path and offset being used for uprobe
+- Success/failure of each uprobe attachment
+
+Look for messages like:
+```
+Searching for 'ceph-osd' in /proc/12345/maps
+  Found matching line: 5555555-5555556 r-xp ... /snap/microceph/.../ceph-osd
+  Extracted path: '/snap/microceph/.../ceph-osd'
+Found mapped executable ceph-osd at: /snap/microceph/.../ceph-osd
+Attaching uprobe: function=OSD::dequeue_op path=/snap/... offset=0x123456
+✓ uprobe OSD::dequeue_op attached
+```
+
+If you see errors during attachment, the path or DWARF information may be incorrect.

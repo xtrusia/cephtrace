@@ -148,30 +148,42 @@ int attach_uprobe(struct radostrace_bpf *skel,
 		   int process_id = -1,
 		   int v = 0) {
 
-  std::string pid_path = path;
-  if (process_id != -1) {
-    pid_path = "/proc/" + std::to_string(process_id) + "/root" + path;
-  }
+  // For container/namespace support: always use the original binary path
+  // and let the kernel handle inode resolution across all processes
+  // This fixes the inode mismatch issue in containerized environments
+  std::string binary_path = path;
+  
+  // When process_id is specified, we still use -1 for uprobe attachment
+  // to ensure the probe works across namespace boundaries
+  // The kernel will attach based on binary inode, not namespace-specific paths
+  int attach_pid = -1;
 
   auto &func2pc = dp.mod_func2pc[path];
   size_t func_addr = func2pc[funcname];
+  
+  clog << "Attaching uprobe: function=" << funcname << " path=" << binary_path 
+       << " offset=0x" << std::hex << func_addr << std::dec << endl;
+  
   if (v > 0)
       funcname = funcname + "_v" + std::to_string(v);
   int prog_id = func_progid[funcname];
   struct bpf_link *ulink = bpf_program__attach_uprobe(
       *skel->skeleton->progs[prog_id].prog,
       false /* not uretprobe */,
-      process_id,  // Use the specified process ID
-      pid_path.c_str(), func_addr);
+      attach_pid,
+      binary_path.c_str(), func_addr);
   if (!ulink) {
-    cerr << "Failed to attach uprobe to " << funcname << endl;
+    cerr << "Failed to attach uprobe to " << funcname << " at " << binary_path 
+         << " offset 0x" << std::hex << func_addr << std::dec 
+         << " error: " << strerror(errno) << endl;
     return -errno;
   }
 
   if (process_id > 0) {
-    clog << "uprobe " << funcname << " attached to process " << process_id << endl;
+    clog << "✓ uprobe " << funcname << " attached (will trace process " << process_id 
+         << " and all other processes using this binary)" << endl;
   } else {
-    clog << "uprobe " << funcname << " attached to all processes" << endl;
+    clog << "✓ uprobe " << funcname << " attached to all processes" << endl;
   }
   return 0;
 }
@@ -183,11 +195,14 @@ int attach_retuprobe(struct radostrace_bpf *skel,
 		   int process_id = -1,
 		   int v = 0) {
 
-  std::string pid_path = path;
-  if (process_id != -1) {
-    pid_path = "/proc/" + std::to_string(process_id) + "/root" + path;
-  }
-
+  // For container/namespace support: always use the original binary path
+  // and let the kernel handle inode resolution across all processes
+  std::string binary_path = path;
+  
+  // For container/namespace support: always use -1 for pid
+  // to ensure the probe works across namespace boundaries
+  int attach_pid = -1;
+  
   auto &func2pc = dp.mod_func2pc[path];
   size_t func_addr = func2pc[funcname];
   if (v > 0)
@@ -196,15 +211,16 @@ int attach_retuprobe(struct radostrace_bpf *skel,
   struct bpf_link *ulink = bpf_program__attach_uprobe(
       *skel->skeleton->progs[prog_id].prog,
       true /* uretprobe */,
-      process_id,  // Use the specified process ID
-      pid_path.c_str(), func_addr);
+      attach_pid,
+      binary_path.c_str(), func_addr);
   if (!ulink) {
     cerr << "Failed to attach uretprobe to " << funcname << endl;
     return -errno;
   }
 
   if (process_id > 0) {
-    clog << "uretprobe " << funcname << " attached to process " << process_id << endl;
+    clog << "uretprobe " << funcname << " attached (will trace process " << process_id 
+         << " and all other processes using this binary)" << endl;
   } else {
     clog << "uretprobe " << funcname << " attached to all processes" << endl;
   }
@@ -495,10 +511,24 @@ int main(int argc, char **argv) {
 
   DwarfParser dwarfparser(rados_probes, probe_units);
 
-  // Use the new function to find library paths dynamically
-  std::string librbd_path = find_library_path("librbd.so.1", process_id);
-  std::string librados_path = find_library_path("librados.so.2", process_id);
-  std::string libceph_common_path = find_library_path("libceph-common.so.2", process_id);
+  // Find library paths - use different method depending on whether we have a PID
+  std::string librbd_path;
+  std::string librados_path;
+  std::string libceph_common_path;
+  
+  if (process_id != -1) {
+    // For containerized processes: use the actual mapped library paths
+    // This ensures we use the correct inode that the kernel sees
+    librbd_path = find_mapped_library_path(process_id, "librbd.so.1");
+    librados_path = find_mapped_library_path(process_id, "librados.so.2");
+    libceph_common_path = find_mapped_library_path(process_id, "libceph-common.so.2");
+    clog << "Using mapped library paths for containerized process " << process_id << endl;
+  } else {
+    // For host processes: use the standard library search
+    librbd_path = find_library_path("librbd.so.1", -1);
+    librados_path = find_library_path("librados.so.2", -1);
+    libceph_common_path = find_library_path("libceph-common.so.2", -1);
+  }
 
   if(librbd_path.empty() || librados_path.empty() || libceph_common_path.empty()) {
     cerr << "Error: Could not find one or more required Ceph libraries:" << endl;

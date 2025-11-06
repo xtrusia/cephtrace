@@ -79,4 +79,15 @@ bool check_process_executable_deleted(int pid, const std::string& exe_name);
  */
 bool check_executable_deleted(int process_id, const std::string& exe_name);
 
+/**
+ * Find the actual memory-mapped library file path from a process's /proc/<pid>/maps.
+ * This returns the real inode path that the kernel uses, which is critical for
+ * uprobe attachment to work correctly across namespaces.
+ *
+ * @param pid The process ID to search libraries for
+ * @param lib_name The name of the library to find (e.g., "librbd.so.1")
+ * @return The actual file path as seen from the process's namespace, or empty string if not found
+ */
+std::string find_mapped_library_path(int pid, const std::string& lib_name);
+
 #endif // VERSION_UTILS_H
