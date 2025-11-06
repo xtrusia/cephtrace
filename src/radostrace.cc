@@ -186,6 +186,14 @@ int attach_uprobe(struct radostrace_bpf *skel,
   // CRITICAL: Store the bpf_link to prevent automatic cleanup
   uprobe_links.push_back(ulink);
   
+  // Verify the link is valid
+  int link_fd = bpf_link__fd(ulink);
+  if (link_fd < 0) {
+    cerr << "Warning: bpf_link__fd returned invalid fd for " << funcname << endl;
+  } else {
+    clog << "  Link FD: " << link_fd << endl;
+  }
+  
   if (process_id > 0) {
     clog << "✓ uprobe " << funcname << " attached to process " << process_id << endl;
   } else {
@@ -647,9 +655,15 @@ int main(int argc, char **argv) {
 
   clog << "\n========================================" << endl;
   clog << "Uprobe Attachment Complete!" << endl;
+  clog << "Total links created: " << uprobe_links.size() << endl;
   clog << "========================================\n" << endl;
   
-  clog << "Setting up ring buffer..." << endl;
+  // Verify uprobes are actually registered
+  clog << "Verifying uprobe registration..." << endl;
+  system("wc -l /sys/kernel/debug/tracing/uprobe_events 2>/dev/null");
+  system("head -5 /sys/kernel/debug/tracing/uprobe_events 2>/dev/null");
+  
+  clog << "\nSetting up ring buffer..." << endl;
 
   rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
   if (!rb) {
