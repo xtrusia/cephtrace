@@ -449,7 +449,42 @@ sudo getcap ./radostrace
 sudo -E ./osdtrace ...
 ```
 
-#### 7. Namespace Issues (Containers/microceph)
+#### 7. DWARF Offset Mismatch (Most Common Issue)
+
+If uprobes attach successfully but no events appear, the DWARF offsets are likely incorrect.
+
+**Symptom**: 
+- Tool says "✓ uprobe attached"
+- No output in `trace_pipe`
+- No events received
+
+**Cause**: The DWARF JSON file was generated from a different binary version than the one actually running.
+
+**Solution**: Generate DWARF JSON directly from the running process's binary:
+
+```bash
+# 1. Generate DWARF JSON from the actual running binary
+sudo ./osdtrace -p <PID> -j osd_dwarf_this_process.json
+
+# 2. Immediately use that JSON file
+sudo ./osdtrace -p <PID> -i osd_dwarf_this_process.json -x --skip-version-check
+
+# 3. Verify in another terminal
+sudo cat /sys/kernel/debug/tracing/trace_pipe | grep uprobe
+
+# 4. Generate I/O
+rados bench -p test 10 write
+```
+
+This ensures the function offsets match exactly.
+
+**Why this happens**:
+- Host has ceph version A, container runs version B
+- Pre-generated JSON is for version C
+- Function addresses differ between versions
+- Uprobe attaches to wrong address → no events
+
+#### 8. Namespace Issues (Containers/microceph)
 
 For containerized environments, the key is using the ACTUAL file path that the kernel sees:
 
