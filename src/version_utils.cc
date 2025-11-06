@@ -390,6 +390,7 @@ std::string find_mapped_library_path(int pid, const std::string& lib_name) {
 
     std::string line;
     std::string result;
+    std::string maps_result;  // Path from maps
     bool found_lib = false;
     
     std::clog << "Searching for '" << lib_name << "' in " << maps_path << std::endl;
@@ -420,15 +421,15 @@ std::string find_mapped_library_path(int pid, const std::string& lib_name) {
                         // This is an executable, check for 'x' permission
                         if (line.find("r-xp") != std::string::npos || 
                             line.find("r-x") != std::string::npos) {
-                            result = path;
-                            std::clog << "Found mapped executable " << lib_name << " at: " << result 
+                            maps_result = path;
+                            std::clog << "Found mapped executable " << lib_name << " at: " << maps_result 
                                       << " in process " << pid << std::endl;
                             break;
                         }
                     } else {
                         // This is a library
-                        result = path;
-                        std::clog << "Found mapped library " << lib_name << " at: " << result 
+                        maps_result = path;
+                        std::clog << "Found mapped library " << lib_name << " at: " << maps_result 
                                   << " in process " << pid << std::endl;
                         break;
                     }
@@ -441,13 +442,64 @@ std::string find_mapped_library_path(int pid, const std::string& lib_name) {
     
     maps_file.close();
     
-    if (result.empty()) {
+    if (maps_result.empty()) {
         if (found_lib) {
             std::cerr << "Warning: Found " << lib_name << " in maps but all entries were deleted or anonymous" << std::endl;
         } else {
             std::cerr << "Warning: Could not find " << lib_name << " in /proc/" << pid << "/maps" << std::endl;
             std::cerr << "Try running: grep " << lib_name << " /proc/" << pid << "/maps" << std::endl;
         }
+        return "";
+    }
+    
+    // CRITICAL: Check if the path from maps is accessible from the host
+    // If not, we need to use /proc/<pid>/root prefix for uprobe to work
+    std::clog << "Checking if path is accessible from host: " << maps_result << std::endl;
+    
+    if (access(maps_result.c_str(), R_OK) == 0) {
+        std::clog << "  ✓ Path is accessible from host" << std::endl;
+        result = maps_result;
+    } else {
+        std::clog << "  ✗ Path NOT accessible from host (namespace isolation)" << std::endl;
+        std::clog << "  Trying /proc/" << pid << "/root prefix..." << std::endl;
+        
+        // For snap/container: the path in maps might not be accessible from host
+        // We need to use /proc/<pid>/root prefix to access it from host namespace
+        std::string root_prefixed = "/proc/" + std::to_string(pid) + "/root" + maps_result;
+        
+        if (access(root_prefixed.c_str(), R_OK) == 0) {
+            std::clog << "  ✓ Accessible via: " << root_prefixed << std::endl;
+            result = root_prefixed;
+        } else {
+            std::cerr << "  ✗ Also not accessible via /proc/PID/root prefix" << std::endl;
+            
+            // Last resort: try /proc/<pid>/exe for executables
+            if (lib_name.find(".so") == std::string::npos) {
+                std::string exe_link = "/proc/" + std::to_string(pid) + "/exe";
+                char exe_path[4096];
+                ssize_t len = readlink(exe_link.c_str(), exe_path, sizeof(exe_path) - 1);
+                if (len != -1) {
+                    exe_path[len] = '\0';
+                    std::string exe_target(exe_path);
+                    // Remove (deleted) suffix
+                    size_t deleted_pos = exe_target.find(" (deleted)");
+                    if (deleted_pos != std::string::npos) {
+                        exe_target = exe_target.substr(0, deleted_pos);
+                    }
+                    std::clog << "  Trying /proc/" << pid << "/exe -> " << exe_target << std::endl;
+                    if (access(exe_target.c_str(), R_OK) == 0) {
+                        std::clog << "  ✓ Accessible via /proc/PID/exe" << std::endl;
+                        result = exe_target;
+                    }
+                }
+            }
+        }
+    }
+    
+    if (result.empty()) {
+        std::cerr << "ERROR: Could not find accessible path for " << lib_name << std::endl;
+        std::cerr << "Path from maps: " << maps_result << std::endl;
+        std::cerr << "This path is inside the container/snap but not accessible from host" << std::endl;
     }
     
     return result;
