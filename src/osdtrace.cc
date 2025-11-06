@@ -1147,21 +1147,22 @@ int attach_uprobe(struct osdtrace_bpf *skel,
                  std::string funcname,
                  int v = 0) {
 
-  // For container/namespace support: always use the original binary path
-  // and let the kernel handle inode resolution across all processes
-  // This fixes the inode mismatch issue in containerized environments
+  // For container/namespace support:
+  // - Use the path from /proc/<pid>/maps (already done in caller)
+  // - Use the SPECIFIC PID so kernel uses that process's namespace to resolve the path
+  // - This ensures we attach to the correct inode even across namespace boundaries
   std::string binary_path = path;
   
-  // When process_id is specified, we still use -1 for uprobe attachment
-  // to ensure the probe works across namespace boundaries
-  // The kernel will attach based on binary inode, not namespace-specific paths
-  int attach_pid = -1;
+  // CRITICAL: When tracing containerized processes, we MUST use the specific PID
+  // so that libbpf/kernel can resolve the path in the correct namespace
+  int attach_pid = process_id;  // Use the actual PID, NOT -1!
 
   auto &func2pc = dp.mod_func2pc[path];
   size_t func_addr = func2pc[funcname];
   
   clog << "Attaching uprobe: function=" << funcname << " path=" << binary_path 
-       << " offset=0x" << std::hex << func_addr << std::dec << endl;
+       << " offset=0x" << std::hex << func_addr << std::dec 
+       << " pid=" << attach_pid << endl;
   
   if (v > 0)
       funcname = funcname + "_v" + std::to_string(v); 
@@ -1174,13 +1175,13 @@ int attach_uprobe(struct osdtrace_bpf *skel,
   if (!ulink) {
     cerr << "Failed to attach uprobe to " << funcname << " at " << binary_path 
          << " offset 0x" << std::hex << func_addr << std::dec
+         << " pid=" << attach_pid
          << " error: " << strerror(errno) << endl;
     return -errno;
   }
 
   if (process_id > 0) {
-    clog << "✓ uprobe " << funcname << " attached (will trace process " << process_id 
-         << " and all other processes using this binary)" << endl;
+    clog << "✓ uprobe " << funcname << " attached to process " << process_id << endl;
   } else {
     clog << "✓ uprobe " << funcname << " attached to all processes" << endl;
   }
@@ -1191,10 +1192,10 @@ int attach_retuprobe(struct osdtrace_bpf *skel,
 	           DwarfParser &dp,
 	           std::string path,
 		   std::string funcname,
+		   int process_id,
 		   int v = 0) {
-  // For container/namespace support: always use -1 for pid
-  // to ensure the probe works across namespace boundaries
-  int attach_pid = -1;
+  // Use the specific PID for namespace resolution
+  int attach_pid = process_id;
   
   auto &func2pc = dp.mod_func2pc[path];
   size_t func_addr = func2pc[funcname];
@@ -1207,11 +1208,11 @@ int attach_retuprobe(struct osdtrace_bpf *skel,
       attach_pid,
       path.c_str(), func_addr);
   if (!ulink) {
-    cerr << "Failed to attach uretprobe to " << funcname << endl;
+    cerr << "Failed to attach uretprobe to " << funcname << " pid=" << attach_pid << endl;
     return -errno;
   }
 
-  clog << "uretprobe " << funcname <<  " attached" << endl;
+  clog << "✓ uretprobe " << funcname << " attached" << endl;
   return 0;
 }
 
