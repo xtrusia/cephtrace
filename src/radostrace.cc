@@ -85,6 +85,9 @@ DwarfParser::probes_t rados_probes = {
 
 volatile sig_atomic_t timeout_occurred = 0;
 
+// Store bpf_links to prevent automatic cleanup
+std::vector<struct bpf_link *> uprobe_links;
+
 // CSV Output
 bool export_csv = false;
 std::string csv_output_file = "radostrace_events.csv";
@@ -180,6 +183,9 @@ int attach_uprobe(struct radostrace_bpf *skel,
     return -errno;
   }
 
+  // CRITICAL: Store the bpf_link to prevent automatic cleanup
+  uprobe_links.push_back(ulink);
+  
   if (process_id > 0) {
     clog << "✓ uprobe " << funcname << " attached to process " << process_id << endl;
   } else {
@@ -214,6 +220,9 @@ int attach_retuprobe(struct radostrace_bpf *skel,
     return -errno;
   }
 
+  // CRITICAL: Store the bpf_link to prevent automatic cleanup
+  uprobe_links.push_back(ulink);
+  
   if (process_id > 0) {
     clog << "✓ uretprobe " << funcname << " attached to process " << process_id << endl;
   } else {
@@ -670,6 +679,13 @@ int main(int argc, char **argv) {
 
 cleanup:
   clog << "Clean up the eBPF program" << endl;
+  
+  // Clean up all uprobe links
+  for (auto link : uprobe_links) {
+    bpf_link__destroy(link);
+  }
+  uprobe_links.clear();
+  
   ring_buffer__free(rb);
   radostrace_bpf__destroy(skel);
   return timeout_occurred ? -1 : -errno;

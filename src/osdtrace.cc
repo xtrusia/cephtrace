@@ -303,6 +303,9 @@ struct op_stat_s op_stat[MAX_OSD];
 struct timespec lasttime;
 __u32 period = 0;
 
+// Store bpf_links to prevent automatic cleanup
+std::vector<struct bpf_link *> uprobe_links;
+
 //@write
 //(0, 4k) num {min=, max=, avg=, 10%=, 50%=, 90%=, 95%=, 99%=, 99.9%=}
 //[4k, 8k) 
@@ -1180,6 +1183,9 @@ int attach_uprobe(struct osdtrace_bpf *skel,
     return -errno;
   }
 
+  // CRITICAL: Store the bpf_link to prevent automatic cleanup
+  uprobe_links.push_back(ulink);
+  
   if (process_id > 0) {
     clog << "✓ uprobe " << funcname << " attached to process " << process_id << endl;
   } else {
@@ -1212,6 +1218,9 @@ int attach_retuprobe(struct osdtrace_bpf *skel,
     return -errno;
   }
 
+  // CRITICAL: Store the bpf_link to prevent automatic cleanup
+  uprobe_links.push_back(ulink);
+  
   clog << "✓ uretprobe " << funcname << " attached" << endl;
   return 0;
 }
@@ -1472,6 +1481,13 @@ int main(int argc, char **argv) {
   clog << "Unexpected line hit" << endl;
 cleanup:
   clog << "Clean up the eBPF program" << endl;
+  
+  // Clean up all uprobe links
+  for (auto link : uprobe_links) {
+    bpf_link__destroy(link);
+  }
+  uprobe_links.clear();
+  
   ring_buffer__free(rb);
   osdtrace_bpf__destroy(skel);
   return timeout_occurred ? -1 : -errno;
