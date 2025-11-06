@@ -160,12 +160,44 @@ int attach_uprobe(struct radostrace_bpf *skel,
   // CRITICAL: When tracing containerized processes, we MUST use the specific PID
   int attach_pid = process_id;  // Use the actual PID, NOT -1!
 
-  auto &func2pc = dp.mod_func2pc[path];
-  size_t func_addr = func2pc[funcname];
+  // Try to find func2pc with the exact path first
+  size_t func_addr = 0;
+  auto func2pc_it = dp.mod_func2pc.find(path);
+  
+  if (func2pc_it != dp.mod_func2pc.end()) {
+    auto func_it = func2pc_it->second.find(funcname);
+    if (func_it != func2pc_it->second.end()) {
+      func_addr = func_it->second;
+    }
+  }
+  
+  // If not found, try to find with any path containing the library name
+  if (func_addr == 0) {
+    std::string binary_basename = path.substr(path.find_last_of('/') + 1);
+    for (const auto& mod_pair : dp.mod_func2pc) {
+      if (mod_pair.first.find(binary_basename) != std::string::npos) {
+        auto func_it = mod_pair.second.find(funcname);
+        if (func_it != mod_pair.second.end()) {
+          func_addr = func_it->second;
+          clog << "  Found function in alternate module path: " << mod_pair.first << endl;
+          break;
+        }
+      }
+    }
+  }
   
   clog << "Attaching uprobe: function=" << funcname << " path=" << binary_path 
        << " offset=0x" << std::hex << func_addr << std::dec
        << " pid=" << attach_pid << endl;
+  
+  if (func_addr == 0) {
+    cerr << "ERROR: Function " << funcname << " not found in DWARF data!" << endl;
+    cerr << "  Available modules in DWARF:" << endl;
+    for (const auto& mod_pair : dp.mod_func2pc) {
+      cerr << "    " << mod_pair.first << " (" << mod_pair.second.size() << " functions)" << endl;
+    }
+    return -1;
+  }
   
   if (v > 0)
       funcname = funcname + "_v" + std::to_string(v);
@@ -213,8 +245,35 @@ int attach_retuprobe(struct radostrace_bpf *skel,
   std::string binary_path = path;
   int attach_pid = process_id;
   
-  auto &func2pc = dp.mod_func2pc[path];
-  size_t func_addr = func2pc[funcname];
+  // Try to find func2pc with the exact path first
+  size_t func_addr = 0;
+  auto func2pc_it = dp.mod_func2pc.find(path);
+  
+  if (func2pc_it != dp.mod_func2pc.end()) {
+    auto func_it = func2pc_it->second.find(funcname);
+    if (func_it != func2pc_it->second.end()) {
+      func_addr = func_it->second;
+    }
+  }
+  
+  // If not found, try to find with any path containing the library name
+  if (func_addr == 0) {
+    std::string binary_basename = path.substr(path.find_last_of('/') + 1);
+    for (const auto& mod_pair : dp.mod_func2pc) {
+      if (mod_pair.first.find(binary_basename) != std::string::npos) {
+        auto func_it = mod_pair.second.find(funcname);
+        if (func_it != mod_pair.second.end()) {
+          func_addr = func_it->second;
+          break;
+        }
+      }
+    }
+  }
+  
+  if (func_addr == 0) {
+    cerr << "ERROR: Function " << funcname << " not found in DWARF data for uretprobe!" << endl;
+    return -1;
+  }
   if (v > 0)
       funcname = funcname + "_v" + std::to_string(v);
   int prog_id = func_progid[funcname];
