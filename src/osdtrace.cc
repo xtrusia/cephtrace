@@ -1249,10 +1249,16 @@ int main(int argc, char **argv) {
   if (process_id != -1) {
     // PID specified - use the actual mapped executable path for correct inode
     // This is critical for containerized/namespace environments
+    clog << "========================================" << endl;
+    clog << "Container/Namespace Mode Enabled" << endl;
+    clog << "Process ID: " << process_id << endl;
+    clog << "========================================" << endl;
+    
     osd_path = find_mapped_library_path(process_id, "ceph-osd");
     
     if (osd_path.empty()) {
       // Fallback: try reading from /proc/<pid>/exe
+      clog << "Fallback: trying /proc/" << process_id << "/exe" << endl;
       std::string exe_link = "/proc/" + std::to_string(process_id) + "/exe";
       char exe_path[PATH_MAX];
       ssize_t len = readlink(exe_link.c_str(), exe_path, sizeof(exe_path) - 1);
@@ -1266,13 +1272,24 @@ int main(int argc, char **argv) {
           target = target.substr(0, deleted_pos);
         }
         osd_path = target;
+        clog << "Using path from /proc/exe: " << osd_path << endl;
       } else {
         std::cerr << "Error: Could not read /proc/" << process_id << "/exe" << std::endl;
         return 1;
       }
     }
     
-    clog << "Using mapped executable path for containerized process " << process_id << ": " << osd_path << endl;
+    clog << "========================================" << endl;
+    clog << "FINAL BINARY PATH: " << osd_path << endl;
+    clog << "========================================" << endl;
+    
+    // Verify file exists and is accessible
+    if (access(osd_path.c_str(), R_OK) != 0) {
+      std::cerr << "ERROR: Cannot access binary at: " << osd_path << endl;
+      std::cerr << "Error: " << strerror(errno) << endl;
+      return 1;
+    }
+    clog << "✓ Binary is accessible" << endl;
 
     // Validate that the process is actually running ceph-osd
     if (osd_path.find("ceph-osd") == std::string::npos) {
@@ -1363,13 +1380,21 @@ int main(int argc, char **argv) {
   fill_map_hprobes(osd_path, dwarfparser, skel->maps.hprobes);
 
   clog << "BPF prog loaded" << endl;
+  
+  clog << "\n========================================" << endl;
+  clog << "Starting Uprobe Attachment" << endl;
+  clog << "Binary: " << osd_path << endl;
+  clog << "Process ID: " << process_id << endl;
+  clog << "========================================\n" << endl;
 
   //Start to load the probes
   if (probe_mode == OP_SINGLE_PROBE) {
+    clog << "Mode: OP_SINGLE_PROBE" << endl;
     attach_uprobe(skel, dwarfparser, osd_path, process_id, "PrimaryLogPG::log_op_stats", 2);
   }
 
   if (probe_mode & OP_FULL_PROBE) {
+    clog << "Mode: OP_FULL_PROBE" << endl;
     attach_uprobe(skel, dwarfparser, osd_path, process_id, "OSD::dequeue_op");
 
     attach_uprobe(skel, dwarfparser, osd_path, process_id, "PrimaryLogPG::execute_ctx");
@@ -1403,7 +1428,11 @@ int main(int argc, char **argv) {
   }
 
   bootstamp = get_bootstamp();
-  clog << "New a ring buffer" << endl;
+  clog << "\n========================================" << endl;
+  clog << "Uprobe Attachment Complete!" << endl;
+  clog << "========================================\n" << endl;
+  
+  clog << "Setting up ring buffer..." << endl;
 
   rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
   if (!rb) {
@@ -1411,7 +1440,15 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
 
-  clog << "Started to poll from ring buffer" << endl;
+  clog << "✓ Ring buffer ready" << endl;
+  clog << "\n========================================" << endl;
+  clog << "WAITING FOR EVENTS..." << endl;
+  clog << "========================================" << endl;
+  clog << "If no events appear:" << endl;
+  clog << "1. Check: sudo cat /sys/kernel/debug/tracing/trace_pipe" << endl;
+  clog << "2. Generate I/O: rados bench -p test 10 write" << endl;
+  clog << "3. Verify binary path matches /proc/" << process_id << "/maps" << endl;
+  clog << "========================================\n" << endl;
 
   clock_gettime(CLOCK_BOOTTIME, &lasttime);
   memset(op_stat, 0, MAX_OSD * sizeof(op_stat[0]));

@@ -516,14 +516,28 @@ int main(int argc, char **argv) {
   std::string librados_path;
   std::string libceph_common_path;
   
+  clog << "\n========================================" << endl;
   if (process_id != -1) {
+    clog << "Container/Namespace Mode Enabled" << endl;
+    clog << "Process ID: " << process_id << endl;
+    clog << "========================================" << endl;
+    
     // For containerized processes: use the actual mapped library paths
     // This ensures we use the correct inode that the kernel sees
     librbd_path = find_mapped_library_path(process_id, "librbd.so.1");
     librados_path = find_mapped_library_path(process_id, "librados.so.2");
     libceph_common_path = find_mapped_library_path(process_id, "libceph-common.so.2");
-    clog << "Using mapped library paths for containerized process " << process_id << endl;
+    
+    clog << "========================================" << endl;
+    clog << "FINAL LIBRARY PATHS:" << endl;
+    clog << "  librbd: " << (librbd_path.empty() ? "NOT FOUND" : librbd_path) << endl;
+    clog << "  librados: " << (librados_path.empty() ? "NOT FOUND" : librados_path) << endl;
+    clog << "  libceph-common: " << (libceph_common_path.empty() ? "NOT FOUND" : libceph_common_path) << endl;
+    clog << "========================================" << endl;
   } else {
+    clog << "Host Mode (no specific PID)" << endl;
+    clog << "========================================" << endl;
+    
     // For host processes: use the standard library search
     librbd_path = find_library_path("librbd.so.1", -1);
     librados_path = find_library_path("librados.so.2", -1);
@@ -614,6 +628,11 @@ int main(int argc, char **argv) {
   fill_map_hprobes(librados_path, dwarfparser, skel->maps.hprobes);
 
   clog << "BPF prog loaded" << endl;
+  
+  clog << "\n========================================" << endl;
+  clog << "Starting Uprobe Attachment" << endl;
+  clog << "Process ID: " << process_id << endl;
+  clog << "========================================\n" << endl;
 
   attach_uprobe(skel, dwarfparser, librados_path, "Objecter::_send_op", process_id);
   attach_uprobe(skel, dwarfparser, librbd_path, "Objecter::_send_op", process_id);
@@ -622,7 +641,11 @@ int main(int argc, char **argv) {
   attach_uprobe(skel, dwarfparser, librbd_path, "Objecter::_finish_op", process_id);
   //attach_uprobe(skel, dwarfparser, libceph_common_path, "Objecter::_finish_op", process_id);
 
-  clog << "New a ring buffer" << endl;
+  clog << "\n========================================" << endl;
+  clog << "Uprobe Attachment Complete!" << endl;
+  clog << "========================================\n" << endl;
+  
+  clog << "Setting up ring buffer..." << endl;
 
   rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
   if (!rb) {
@@ -630,7 +653,17 @@ int main(int argc, char **argv) {
     goto cleanup;
   }
 
-  clog << "Started to poll from ring buffer" << endl;
+  clog << "✓ Ring buffer ready" << endl;
+  clog << "\n========================================" << endl;
+  clog << "WAITING FOR EVENTS..." << endl;
+  clog << "========================================" << endl;
+  clog << "If no events appear:" << endl;
+  clog << "1. Check: sudo cat /sys/kernel/debug/tracing/trace_pipe" << endl;
+  clog << "2. Generate I/O: rados bench -p test 10 write" << endl;
+  if (process_id != -1) {
+    clog << "3. Verify library paths match /proc/" << process_id << "/maps" << endl;
+  }
+  clog << "========================================\n" << endl;
 
   while ((!timeout_occurred || timeout == -1) && (ret = ring_buffer__poll(rb, 1000)) >= 0) {
       // Continue polling while timeout hasn't occurred or if unlimited execution time
