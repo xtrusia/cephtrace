@@ -193,11 +193,15 @@ wait
 
 info "=== Step 10: Verify osdtrace output ==="
 
-# 10.1 Check trace exists
-OSD_LINE_COUNT=$(wc -l < $OSDTRACE_LOG)
-info "osdtrace captured $OSD_LINE_COUNT lines"
+# 10.1 Count *trace rows* (`osd <id> pg <pgid> ...`), not the full log.
+# Startup/diagnostic output (probe-load messages, BPF init, attach logs)
+# easily exceeds the threshold by itself, so a `wc -l` floor would pass
+# even when zero events were captured.  Predicate matches the same
+# `$1=="osd" && $3=="pg"` filter used by 10.3/10.4/10.5 below.
+OSD_LINE_COUNT=$(awk '$1=="osd" && $3=="pg"' $OSDTRACE_LOG | wc -l)
+info "osdtrace captured $OSD_LINE_COUNT trace rows"
 if [ $OSD_LINE_COUNT -lt 50 ]; then
-    err "osdtrace did not capture enough trace data (expected at least 5 lines)"
+    err "osdtrace did not capture enough trace data (expected >= 50 rows, got $OSD_LINE_COUNT)"
     exit 1
 fi
 
@@ -214,7 +218,7 @@ fi
 
 # 10.3 Check the correct pool id is used
 TEST_POOL_ID=$(microceph.ceph osd pool ls detail | grep "^pool.*'test_pool'" | grep -oP "pool \K\d+")
-pool_id_err=$(awk -v p_id=$TEST_POOL_ID '$1=="osd" && $2=="pg"{split($4, a, "."); if (a[1] != p_id) {print a[1]; exit}}' $OSDTRACE_LOG)
+pool_id_err=$(awk -v p_id=$TEST_POOL_ID '$1=="osd" && $3=="pg"{split($4, a, "."); if (a[1] != p_id) {print a[1]; exit}}' $OSDTRACE_LOG)
 if [ -n "$pool_id_err" ]; then
     err "Unexpected pool id found in osdtrace, $pool_id_err"
     exit 1
@@ -222,7 +226,7 @@ fi
 
 # 10.4 Check PG ranges in the test pool
 TOT_PG=$(microceph.ceph osd pool get test_pool pg_num | awk '{print $2}')
-pg_range_err=$(awk -v tot=$TOT_PG '$1=="osd" && $2=="pg"{split($4, a, "."); pg=strtonum(a[2]); if (pg < 0 || pg >= tot)print a[2]}' $OSDTRACE_LOG)
+pg_range_err=$(awk -v tot=$TOT_PG '$1=="osd" && $3=="pg"{split($4, a, "."); pg=strtonum(a[2]); if (pg < 0 || pg >= tot)print a[2]}' $OSDTRACE_LOG)
 if [[ -n $pg_range_err ]]; then
     err "Found PGs outside the expected range: $pg_range_err"
     exit 1
@@ -231,7 +235,7 @@ fi
 # 10.5 Check for high latencies
 # Maximum acceptable latency value (in microseconds) = 100s
 MAX_LATENCY=100000000
-high_lat=$(awk -v lmax=$MAX_LATENCY '$1=="osd" && $2=="pg" && $NF > lmax' $OSDTRACE_LOG)
+high_lat=$(awk -v lmax=$MAX_LATENCY '$1=="osd" && $3=="pg" && $NF > lmax' $OSDTRACE_LOG)
 if [[ -n $high_lat ]]; then
     err "Found latencies over $MAX_LATENCY μs"
     exit 1
@@ -247,11 +251,13 @@ info "=== Step 11: Verify radostrace output ==="
 # ("pid  client  tid ...")
 # and any status/error messages.
 
-# 11.1 At least 50 data lines captured
-RADOS_DATA_LINES=$(wc -l < $RADOSTRACE_LOG)
-info "radostrace captured $RADOS_DATA_LINES data lines"
+# 11.1 At least 50 data rows captured (see 10.1 for why we count rows
+# instead of all log lines).  Predicate matches the same
+# `$1 ~ /^[0-9]+$/ && NF >= 9` filter used by 11.2/11.3/11.4/11.5 below.
+RADOS_DATA_LINES=$(awk '$1 ~ /^[0-9]+$/ && NF >= 9' $RADOSTRACE_LOG | wc -l)
+info "radostrace captured $RADOS_DATA_LINES trace rows"
 if [ "$RADOS_DATA_LINES" -lt 50 ]; then
-    err "radostrace did not capture enough data (expected >= 50 lines, got $RADOS_DATA_LINES)"
+    err "radostrace did not capture enough data (expected >= 50 rows, got $RADOS_DATA_LINES)"
     exit 1
 fi
 
@@ -303,8 +309,8 @@ info "✓ All radostrace output fields validated successfully"
 
 info "=== Test Summary ==="
 info "✓ MicroCeph cluster deployed successfully"
-info "✓ osdtrace captured $OSD_LINE_COUNT lines of trace data"
-info "✓ radostrace captured $RADOS_LINE_COUNT lines of trace data"
+info "✓ osdtrace captured $OSD_LINE_COUNT trace rows"
+info "✓ radostrace captured $RADOS_DATA_LINES trace rows"
 info "✓ All functional tests passed!"
 
 exit 0
