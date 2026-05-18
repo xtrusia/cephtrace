@@ -158,10 +158,16 @@ fi
 # Embedded mode binds to addresses baked into the binary at build time, so a
 # snap rebuild of the same Ceph version can shift addresses enough that some
 # uprobes fail to attach (-ENOEXEC), legitimately reducing trace volume.
-OSD_LINE_COUNT=$(wc -l < $OSDTRACE_LOG)
-info "osdtrace captured $OSD_LINE_COUNT lines"
+#
+# Count *data rows* only (`osd <id> pg <pgid> ...`), not the full log line
+# count.  Startup/diagnostic output (probe-load messages, BPF init, embedded
+# match marker, attach logs) easily exceeds 20 lines by itself, so `wc -l`
+# would pass even when zero events were captured.  Filter matches the same
+# `$1=="osd" && $2=="pg"` predicate used by 8.3/8.4/8.5/8.6 below.
+OSD_LINE_COUNT=$(awk '$1=="osd" && $2=="pg"' $OSDTRACE_LOG | wc -l)
+info "osdtrace captured $OSD_LINE_COUNT trace rows"
 if [ $OSD_LINE_COUNT -lt 20 ]; then
-    err "osdtrace did not capture enough trace data (expected at least 20 lines)"
+    err "osdtrace did not capture enough trace data (expected at least 20 rows, got $OSD_LINE_COUNT)"
     exit 1
 fi
 
@@ -217,11 +223,14 @@ else
     exit 1
 fi
 
-# 9.2 At least 20 data lines captured (see 8.2 for why this is lower than func-test).
-RADOS_DATA_LINES=$(wc -l < $RADOSTRACE_LOG)
-info "radostrace captured $RADOS_DATA_LINES data lines"
+# 9.2 At least 20 data rows captured (see 8.2 for why this is lower than
+# func-test, and why we count rows instead of all log lines).  Filter
+# matches the same `$1 ~ /^[0-9]+$/ && NF >= 9` predicate used by
+# 9.3/9.4/9.5/9.6 below.
+RADOS_DATA_LINES=$(awk '$1 ~ /^[0-9]+$/ && NF >= 9' $RADOSTRACE_LOG | wc -l)
+info "radostrace captured $RADOS_DATA_LINES trace rows"
 if [ "$RADOS_DATA_LINES" -lt 20 ]; then
-    err "radostrace did not capture enough data (expected >= 20 lines, got $RADOS_DATA_LINES)"
+    err "radostrace did not capture enough data (expected >= 20 rows, got $RADOS_DATA_LINES)"
     exit 1
 fi
 
@@ -271,8 +280,8 @@ info "✓ All radostrace output fields validated successfully"
 
 info "=== Test Summary ==="
 info "✓ MicroCeph cluster deployed successfully"
-info "✓ osdtrace captured $OSD_LINE_COUNT lines (see Step 8.1 for embedded vs fallback path)"
-info "✓ radostrace captured $RADOS_DATA_LINES lines (see Step 9.1 for embedded vs fallback path)"
+info "✓ osdtrace captured $OSD_LINE_COUNT trace rows (see Step 8.1 for embedded vs fallback path)"
+info "✓ radostrace captured $RADOS_DATA_LINES trace rows (see Step 9.1 for embedded vs fallback path)"
 info "✓ All E2E checks passed!"
 
 exit 0
