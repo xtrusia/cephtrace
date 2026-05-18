@@ -1035,13 +1035,21 @@ bool DwarfParser::import_from_embedded(
         return false;
     }
 
-    // Linear scan: an entry matches iff its modules[] set equals `want`
-    // exactly.  Any empty build-id in the embedded data disqualifies that
-    // entry (legacy JSONs predating the build-id scheme).
+    // Linear scan: an entry matches iff every module it lists is present in
+    // `want` (subset semantics).  The caller always supplies one tuple per
+    // library it intends to probe; the embedded entry may legitimately
+    // cover only a strict subset of those — e.g. Ceph 20.2 moved the
+    // Objecter symbols out of librbd/librados into libceph-common, so the
+    // 20.2.x radostrace entry holds data only for libceph-common.so.2 even
+    // though the caller still passes (librbd, librados, libceph-common).
+    // The per-module build-id pins identity, so subset matching can't
+    // confuse two different package versions.  Any empty build-id in the
+    // embedded data disqualifies that entry (legacy JSONs predating the
+    // build-id scheme).
     const EmbeddedVersion* match = nullptr;
     for (int i = 0; i < count; ++i) {
         const EmbeddedVersion& v = versions[i];
-        if (static_cast<size_t>(v.num_modules) != want.size()) continue;
+        if (v.num_modules == 0) continue;
 
         bool all_match = true;
         for (int m = 0; m < v.num_modules; ++m) {
