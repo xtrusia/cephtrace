@@ -679,19 +679,29 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // map_fd = bpf_object__find_map_fd_by_name(skel->obj, "hprobes");
-
-  //fill_map_hprobes(libceph_common_path, dwarfparser, skel->maps.hprobes);
-  fill_map_hprobes(librados_path, dwarfparser, skel->maps.hprobes);
+  // Populate the per-function hprobes map from whichever library carries
+  // the DWARF info.  In squid the Objecter symbol is statically duplicated
+  // across all three libraries (same source, same compiler -> identical
+  // varloc/fields), so later writes are no-ops; in tentacle the data only
+  // lives in libceph-common.so.2.  fill_map_hprobes is a no-op for any
+  // path whose mod_func2vf entry is empty.
+  std::vector<std::string> rados_lib_paths = {
+      librados_path, librbd_path, libceph_common_path};
+  for (const auto& p : rados_lib_paths) {
+    fill_map_hprobes(p, dwarfparser, skel->maps.hprobes);
+  }
 
   clog << "BPF prog loaded" << endl;
 
-  attach_uprobe(skel, dwarfparser, librados_path, "Objecter::_send_op", process_id);
-  attach_uprobe(skel, dwarfparser, librbd_path, "Objecter::_send_op", process_id);
-  //attach_uprobe(skel, dwarfparser, libceph_common_path, "Objecter::_send_op", process_id);
-  attach_uprobe(skel, dwarfparser, librados_path, "Objecter::_finish_op", process_id);
-  attach_uprobe(skel, dwarfparser, librbd_path, "Objecter::_finish_op", process_id);
-  //attach_uprobe(skel, dwarfparser, libceph_common_path, "Objecter::_finish_op", process_id);
+  // Attach uprobes for every (lib, func) where the lib actually contains
+  // the symbol.  attach_uprobe already prints "func_addr is zero ...
+  // skipping" and returns -1 for the absent ones.  Without iterating all
+  // three libs, tentacle (Objecter only in libceph-common) would attach
+  // nothing and silently produce zero trace rows.
+  for (const auto& p : rados_lib_paths) {
+    attach_uprobe(skel, dwarfparser, p, "Objecter::_send_op", process_id);
+    attach_uprobe(skel, dwarfparser, p, "Objecter::_finish_op", process_id);
+  }
 
   clog << "New a ring buffer" << endl;
 
