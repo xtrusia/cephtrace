@@ -87,7 +87,7 @@ fi
 microceph.rbd create test_pool/testimage --size 1G || true
 
 info "=== Step 4: Start osdtrace in background (embedded mode, no --import-json) ==="
-timeout 30 $PROJECT_ROOT/osdtrace -p $OSD_PID --skip-version-check -x >$OSDTRACE_LOG 2>&1 &
+timeout 30 $PROJECT_ROOT/osdtrace -p $OSD_PID -x >$OSDTRACE_LOG 2>&1 &
 sleep 2 # ensure osdtrace starts before we get its PID
 OSDTRACE_PID=$(pidof osdtrace)
 info "Started osdtrace with PID $OSDTRACE_PID"
@@ -119,7 +119,7 @@ if [ -z "$RBD_ACTUAL_PID" ]; then
 fi
 info "Attaching radostrace to rbd PID $RBD_ACTUAL_PID (confirmed librados-loaded)"
 
-timeout 30 $PROJECT_ROOT/radostrace -p $RBD_ACTUAL_PID --skip-version-check >$RADOSTRACE_LOG 2>&1 &
+timeout 30 $PROJECT_ROOT/radostrace -p $RBD_ACTUAL_PID >$RADOSTRACE_LOG 2>&1 &
 sleep 2 # ensure radostrace starts before we get its PID
 RADOSTRACE_PID=$(pidof radostrace)
 info "Started radostrace with PID $RADOSTRACE_PID"
