@@ -193,20 +193,28 @@ wait
 
 info "=== Step 10: Verify osdtrace output ==="
 
-# 10.1 Count *trace rows* (`osd <id> pg <pgid> ...`), not the full log.
-# Startup/diagnostic output (probe-load messages, BPF init, attach logs)
-# easily exceeds the threshold by itself, so a `wc -l` floor would pass
-# even when zero events were captured.  Predicate matches the same
-# `$1=="osd" && $3=="pg"` filter used by 10.3/10.4/10.5 below.
-OSD_LINE_COUNT=$(awk '$1=="osd" && $3=="pg"' $OSDTRACE_LOG | wc -l)
-info "osdtrace captured $OSD_LINE_COUNT trace rows"
+# Resolve the test_pool id once — used by 10.1, 10.3 and 10.4.
+TEST_POOL_ID=$(microceph.ceph osd pool ls detail | grep "^pool.*'test_pool'" | grep -oP "pool \K\d+")
+info "test_pool pool id: $TEST_POOL_ID"
+
+# 10.1 Trace rows captured FOR test_pool specifically.  `osdtrace -p $OSD_PID`
+# also captures internal MicroCeph traffic (.mgr/.osd metadata pools), so a
+# global "no foreign pool ids" check would always fail — what we want to
+# verify is that the rbd-bench traffic for *our* pool reached the BPF
+# program.  Also: counting just "any osd-pg row" wouldn't catch a regression
+# where internal pools alone produce >=50 rows while test_pool produces 0.
+OSD_LINE_COUNT=$(awk -v p_id="$TEST_POOL_ID" \
+    '$1=="osd" && $3=="pg" { split($4, a, "."); if (a[1] == p_id) c++ } END { print c+0 }' \
+    $OSDTRACE_LOG)
+info "osdtrace captured $OSD_LINE_COUNT trace rows for test_pool (pool id $TEST_POOL_ID)"
 if [ $OSD_LINE_COUNT -lt 50 ]; then
-    err "osdtrace did not capture enough trace data (expected >= 50 rows, got $OSD_LINE_COUNT)"
+    err "osdtrace did not capture enough trace data for test_pool (expected >= 50 rows, got $OSD_LINE_COUNT)"
     exit 1
 fi
 
-# 10.2 Check OSD IDs range is within the expected limit
-# Use 'osd ls' to get the actual highest OSD ID; OSD numbering may not start at 0.
+# 10.2 Check OSD IDs range (global invariant — applies to every captured row
+# regardless of pool).  Use 'osd ls' to get the actual highest OSD ID; OSD
+# numbering may not start at 0.
 MAX_OSD_ID=$(microceph.ceph osd ls | sort -n | tail -1)
 info "Max OSD ID in cluster: $MAX_OSD_ID"
 
@@ -216,23 +224,22 @@ if [ -n "$osd_id_err" ]; then
     exit 1
 fi
 
-# 10.3 Check the correct pool id is used
-TEST_POOL_ID=$(microceph.ceph osd pool ls detail | grep "^pool.*'test_pool'" | grep -oP "pool \K\d+")
-pool_id_err=$(awk -v p_id=$TEST_POOL_ID '$1=="osd" && $3=="pg"{split($4, a, "."); if (a[1] != p_id) {print a[1]; exit}}' $OSDTRACE_LOG)
-if [ -n "$pool_id_err" ]; then
-    err "Unexpected pool id found in osdtrace, $pool_id_err"
-    exit 1
-fi
-
-# 10.4 Check PG ranges in the test pool
+# 10.3 Check PG ranges in the test pool — restricted to test_pool rows so we
+# don't trip over PGs of internal pools that happen to land on the same OSD.
 TOT_PG=$(microceph.ceph osd pool get test_pool pg_num | awk '{print $2}')
-pg_range_err=$(awk -v tot=$TOT_PG '$1=="osd" && $3=="pg"{split($4, a, "."); pg=strtonum(a[2]); if (pg < 0 || pg >= tot)print a[2]}' $OSDTRACE_LOG)
+pg_range_err=$(awk -v p_id="$TEST_POOL_ID" -v tot=$TOT_PG \
+    '$1=="osd" && $3=="pg" {
+        split($4, a, ".")
+        if (a[1] != p_id) next
+        pg = strtonum(a[2])
+        if (pg < 0 || pg >= tot) print a[2]
+    }' $OSDTRACE_LOG)
 if [[ -n $pg_range_err ]]; then
     err "Found PGs outside the expected range: $pg_range_err"
     exit 1
 fi
 
-# 10.5 Check for high latencies
+# 10.4 Check for high latencies (global invariant — any pool).
 # Maximum acceptable latency value (in microseconds) = 100s
 MAX_LATENCY=100000000
 high_lat=$(awk -v lmax=$MAX_LATENCY '$1=="osd" && $3=="pg" && $NF > lmax' $OSDTRACE_LOG)
