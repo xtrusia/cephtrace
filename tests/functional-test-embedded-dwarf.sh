@@ -163,8 +163,8 @@ fi
 # count.  Startup/diagnostic output (probe-load messages, BPF init, embedded
 # match marker, attach logs) easily exceeds 20 lines by itself, so `wc -l`
 # would pass even when zero events were captured.  Filter matches the same
-# `$1=="osd" && $2=="pg"` predicate used by 8.3/8.4/8.5/8.6 below.
-OSD_LINE_COUNT=$(awk '$1=="osd" && $2=="pg"' $OSDTRACE_LOG | wc -l)
+# `$1=="osd" && $3=="pg"` predicate used by 8.3/8.4/8.5/8.6 below.
+OSD_LINE_COUNT=$(awk '$1=="osd" && $3=="pg"' $OSDTRACE_LOG | wc -l)
 info "osdtrace captured $OSD_LINE_COUNT trace rows"
 if [ $OSD_LINE_COUNT -lt 20 ]; then
     err "osdtrace did not capture enough trace data (expected at least 20 rows, got $OSD_LINE_COUNT)"
@@ -183,7 +183,7 @@ fi
 
 # 8.4 Correct pool id is used
 TEST_POOL_ID=$(microceph.ceph osd pool ls detail | grep "^pool.*'test_pool'" | grep -oP "pool \K\d+")
-pool_id_err=$(awk -v p_id=$TEST_POOL_ID '$1=="osd" && $2=="pg"{split($4, a, "."); if (a[1] != p_id) {print a[1]; exit}}' $OSDTRACE_LOG)
+pool_id_err=$(awk -v p_id=$TEST_POOL_ID '$1=="osd" && $3=="pg"{split($4, a, "."); if (a[1] != p_id) {print a[1]; exit}}' $OSDTRACE_LOG)
 if [ -n "$pool_id_err" ]; then
     err "Unexpected pool id found in osdtrace, $pool_id_err"
     exit 1
@@ -191,7 +191,7 @@ fi
 
 # 8.5 PG ranges in the test pool
 TOT_PG=$(microceph.ceph osd pool get test_pool pg_num | awk '{print $2}')
-pg_range_err=$(awk -v tot=$TOT_PG '$1=="osd" && $2=="pg"{split($4, a, "."); pg=strtonum(a[2]); if (pg < 0 || pg >= tot)print a[2]}' $OSDTRACE_LOG)
+pg_range_err=$(awk -v tot=$TOT_PG '$1=="osd" && $3=="pg"{split($4, a, "."); pg=strtonum(a[2]); if (pg < 0 || pg >= tot)print a[2]}' $OSDTRACE_LOG)
 if [[ -n $pg_range_err ]]; then
     err "Found PGs outside the expected range: $pg_range_err"
     exit 1
@@ -199,7 +199,7 @@ fi
 
 # 8.6 High latencies (max 100s = 100,000,000 µs)
 MAX_LATENCY=100000000
-high_lat=$(awk -v lmax=$MAX_LATENCY '$1=="osd" && $2=="pg" && $NF > lmax' $OSDTRACE_LOG)
+high_lat=$(awk -v lmax=$MAX_LATENCY '$1=="osd" && $3=="pg" && $NF > lmax' $OSDTRACE_LOG)
 if [[ -n $high_lat ]]; then
     err "Found latencies over $MAX_LATENCY μs"
     exit 1
