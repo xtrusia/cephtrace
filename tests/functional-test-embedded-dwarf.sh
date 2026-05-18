@@ -204,8 +204,13 @@ if [[ -n $pg_range_err ]]; then
 fi
 
 # 8.5 High latencies (max 100s = 100,000,000 µs) — global invariant.
+# `$NF + 0` forces numeric coercion.  If osdtrace was killed mid-print, the
+# log can end in a truncated record whose last field is a non-numeric
+# fragment (e.g. "s" from a half-emitted "seq_wait").  Without coercion
+# awk falls back to lexicographic comparison: "s" (0x73) > "100000000"
+# (0x31) is true, producing a spurious match on a corruption artifact.
 MAX_LATENCY=100000000
-high_lat=$(awk -v lmax=$MAX_LATENCY '$1=="osd" && $3=="pg" && $NF > lmax' $OSDTRACE_LOG)
+high_lat=$(awk -v lmax=$MAX_LATENCY '$1=="osd" && $3=="pg" && ($NF + 0) > lmax' $OSDTRACE_LOG)
 if [[ -n $high_lat ]]; then
     err "Found latencies over $MAX_LATENCY μs"
     exit 1
