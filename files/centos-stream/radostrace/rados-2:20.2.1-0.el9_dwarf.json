@@ -1,6 +1,8 @@
 {
   "version": "2:20.2.1-0.el9",
+  "arch": "amd64",
   "libceph-common.so.2": {
+    "build_id": "43e7c266a30136e7baa4885573f28e98adfad83b",
     "func2pc": {
       "Objecter::_finish_op": 6644640,
       "Objecter::_send_op": 6685120

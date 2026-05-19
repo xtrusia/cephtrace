@@ -93,12 +93,14 @@ fi
 info "Ceph version: $CEPH_VERSION"
 
 info "=== Step 3: Locate DWARF JSON files in repository ==="
-# Look for matching DWARF files in the repository
-OSD_DWARF="$PROJECT_ROOT/files/ubuntu/osdtrace/osd-${CEPH_VERSION}_dwarf.json"
-RADOS_DWARF="$PROJECT_ROOT/files/ubuntu/radostrace/${CEPH_VERSION}_dwarf.json"
+# Reference filenames may carry an optional architecture suffix
+# (e.g. osd-19.2.3-0ubuntu0.24.04.3_arm64_dwarf.json) when multiple arches
+# of the same package version are checked in.  Glob and pick the first match.
+OSD_DWARF=$(ls "$PROJECT_ROOT/files/ubuntu/osdtrace/osd-${CEPH_VERSION}"*_dwarf.json 2>/dev/null | head -1)
+RADOS_DWARF=$(ls "$PROJECT_ROOT/files/ubuntu/radostrace/${CEPH_VERSION}"*_dwarf.json 2>/dev/null | head -1)
 
-if [ ! -f "$OSD_DWARF" ]; then
-    info "OSD DWARF file not found at $OSD_DWARF"
+if [ -z "$OSD_DWARF" ]; then
+    info "OSD DWARF file not found for version ${CEPH_VERSION}"
     info "Looking for any available OSD DWARF files..."
     OSD_DWARF=$(find "$PROJECT_ROOT/files/ubuntu/osdtrace/" -name "*_dwarf.json" | head -1)
     if [ -z "$OSD_DWARF" ]; then
@@ -108,8 +110,8 @@ if [ ! -f "$OSD_DWARF" ]; then
     info "Using: $OSD_DWARF"
 fi
 
-if [ ! -f "$RADOS_DWARF" ]; then
-    info "Rados DWARF file not found at $RADOS_DWARF"
+if [ -z "$RADOS_DWARF" ]; then
+    info "Rados DWARF file not found for version ${CEPH_VERSION}"
     info "Looking for any available radostrace DWARF files..."
     RADOS_DWARF=$(find "$PROJECT_ROOT/files/ubuntu/radostrace/" -name "*_dwarf.json" | head -1)
     if [ -z "$RADOS_DWARF" ]; then
@@ -191,16 +193,28 @@ wait
 
 info "=== Step 10: Verify osdtrace output ==="
 
-# 10.1 Check trace exists
-OSD_LINE_COUNT=$(wc -l < $OSDTRACE_LOG)
-info "osdtrace captured $OSD_LINE_COUNT lines"
+# Resolve the test_pool id once — used by 10.1, 10.3 and 10.4.
+TEST_POOL_ID=$(microceph.ceph osd pool ls detail | grep "^pool.*'test_pool'" | grep -oP "pool \K\d+")
+info "test_pool pool id: $TEST_POOL_ID"
+
+# 10.1 Trace rows captured FOR test_pool specifically.  `osdtrace -p $OSD_PID`
+# also captures internal MicroCeph traffic (.mgr/.osd metadata pools), so a
+# global "no foreign pool ids" check would always fail — what we want to
+# verify is that the rbd-bench traffic for *our* pool reached the BPF
+# program.  Also: counting just "any osd-pg row" wouldn't catch a regression
+# where internal pools alone produce >=50 rows while test_pool produces 0.
+OSD_LINE_COUNT=$(awk -v p_id="$TEST_POOL_ID" \
+    '$1=="osd" && $3=="pg" { split($4, a, "."); if (a[1] == p_id) c++ } END { print c+0 }' \
+    $OSDTRACE_LOG)
+info "osdtrace captured $OSD_LINE_COUNT trace rows for test_pool (pool id $TEST_POOL_ID)"
 if [ $OSD_LINE_COUNT -lt 50 ]; then
-    err "osdtrace did not capture enough trace data (expected at least 5 lines)"
+    err "osdtrace did not capture enough trace data for test_pool (expected >= 50 rows, got $OSD_LINE_COUNT)"
     exit 1
 fi
 
-# 10.2 Check OSD IDs range is within the expected limit
-# Use 'osd ls' to get the actual highest OSD ID; OSD numbering may not start at 0.
+# 10.2 Check OSD IDs range (global invariant — applies to every captured row
+# regardless of pool).  Use 'osd ls' to get the actual highest OSD ID; OSD
+# numbering may not start at 0.
 MAX_OSD_ID=$(microceph.ceph osd ls | sort -n | tail -1)
 info "Max OSD ID in cluster: $MAX_OSD_ID"
 
@@ -210,26 +224,30 @@ if [ -n "$osd_id_err" ]; then
     exit 1
 fi
 
-# 10.3 Check the correct pool id is used
-TEST_POOL_ID=$(microceph.ceph osd pool ls detail | grep "^pool.*'test_pool'" | grep -oP "pool \K\d+")
-pool_id_err=$(awk -v p_id=$TEST_POOL_ID '$1=="osd" && $2=="pg"{split($4, a, "."); if (a[1] != p_id) {print a[1]; exit}}' $OSDTRACE_LOG)
-if [ -n "$pool_id_err" ]; then
-    err "Unexpected pool id found in osdtrace, $pool_id_err"
-    exit 1
-fi
-
-# 10.4 Check PG ranges in the test pool
+# 10.3 Check PG ranges in the test pool — restricted to test_pool rows so we
+# don't trip over PGs of internal pools that happen to land on the same OSD.
 TOT_PG=$(microceph.ceph osd pool get test_pool pg_num | awk '{print $2}')
-pg_range_err=$(awk -v tot=$TOT_PG '$1=="osd" && $2=="pg"{split($4, a, "."); pg=strtonum(a[2]); if (pg < 0 || pg >= tot)print a[2]}' $OSDTRACE_LOG)
+pg_range_err=$(awk -v p_id="$TEST_POOL_ID" -v tot=$TOT_PG \
+    '$1=="osd" && $3=="pg" {
+        split($4, a, ".")
+        if (a[1] != p_id) next
+        pg = strtonum(a[2])
+        if (pg < 0 || pg >= tot) print a[2]
+    }' $OSDTRACE_LOG)
 if [[ -n $pg_range_err ]]; then
     err "Found PGs outside the expected range: $pg_range_err"
     exit 1
 fi
 
-# 10.5 Check for high latencies
-# Maximum acceptable latency value (in microseconds) = 100s
+# 10.4 Check for high latencies (global invariant — any pool).
+# Maximum acceptable latency value (in microseconds) = 100s.
+# `$NF + 0` forces numeric coercion.  If osdtrace was killed mid-print, the
+# log can end in a truncated record whose last field is a non-numeric
+# fragment (e.g. "s" from a half-emitted "seq_wait").  Without coercion
+# awk falls back to lexicographic comparison: "s" (0x73) > "100000000"
+# (0x31) is true, producing a spurious match on a corruption artifact.
 MAX_LATENCY=100000000
-high_lat=$(awk -v lmax=$MAX_LATENCY '$1=="osd" && $2=="pg" && $NF > lmax' $OSDTRACE_LOG)
+high_lat=$(awk -v lmax=$MAX_LATENCY '$1=="osd" && $3=="pg" && ($NF + 0) > lmax' $OSDTRACE_LOG)
 if [[ -n $high_lat ]]; then
     err "Found latencies over $MAX_LATENCY μs"
     exit 1
@@ -245,11 +263,13 @@ info "=== Step 11: Verify radostrace output ==="
 # ("pid  client  tid ...")
 # and any status/error messages.
 
-# 11.1 At least 50 data lines captured
-RADOS_DATA_LINES=$(wc -l < $RADOSTRACE_LOG)
-info "radostrace captured $RADOS_DATA_LINES data lines"
+# 11.1 At least 50 data rows captured (see 10.1 for why we count rows
+# instead of all log lines).  Predicate matches the same
+# `$1 ~ /^[0-9]+$/ && NF >= 9` filter used by 11.2/11.3/11.4/11.5 below.
+RADOS_DATA_LINES=$(awk '$1 ~ /^[0-9]+$/ && NF >= 9' $RADOSTRACE_LOG | wc -l)
+info "radostrace captured $RADOS_DATA_LINES trace rows"
 if [ "$RADOS_DATA_LINES" -lt 50 ]; then
-    err "radostrace did not capture enough data (expected >= 50 lines, got $RADOS_DATA_LINES)"
+    err "radostrace did not capture enough data (expected >= 50 rows, got $RADOS_DATA_LINES)"
     exit 1
 fi
 
@@ -301,8 +321,8 @@ info "✓ All radostrace output fields validated successfully"
 
 info "=== Test Summary ==="
 info "✓ MicroCeph cluster deployed successfully"
-info "✓ osdtrace captured $OSD_LINE_COUNT lines of trace data"
-info "✓ radostrace captured $RADOS_LINE_COUNT lines of trace data"
+info "✓ osdtrace captured $OSD_LINE_COUNT trace rows"
+info "✓ radostrace captured $RADOS_DATA_LINES trace rows"
 info "✓ All functional tests passed!"
 
 exit 0
