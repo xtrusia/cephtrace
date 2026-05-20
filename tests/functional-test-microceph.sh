@@ -14,6 +14,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/log.sh"
 # shellcheck source=lib/microceph-setup.sh
 source "$SCRIPT_DIR/lib/microceph-setup.sh"
+# shellcheck source=lib/verify-trace-output.sh
+source "$SCRIPT_DIR/lib/verify-trace-output.sh"
 
 echo "=== MicroCeph Functional Test for osdtrace and radostrace ==="
 echo "Project root: $PROJECT_ROOT"
@@ -151,9 +153,12 @@ info "Started osdtrace with PID $OSDTRACE_PID"
 sleep 3
 
 info "=== Step 7: Generate I/O traffic using rbd bench ==="
-# Run rbd bench for write operations
-info "Running rbd bench write..."
-microceph.rbd bench --io-type write --io-size 4M --io-threads 2 --io-total 400M test_pool/testimage &
+# Mix of reads and writes — radostrace only sees the rbd PID it attaches to,
+# so the bench itself must produce both directions for the W+R diversity
+# check in verify_radostrace_output to be meaningful.
+info "Running rbd bench readwrite..."
+microceph.rbd bench --io-type readwrite --rw-mix-read 50 \
+    --io-size 4M --io-threads 2 --io-total 400M test_pool/testimage &
 
 info "=== Step 8: Start radostrace in background ==="
 # microceph.rbd bench runs through a snap wrapper chain (snap-run → snap-confine → rbd).
@@ -191,138 +196,24 @@ microceph.rados -p test_pool rm testobj || true
 info "=== Step 9: Wait for all traces to complete"
 wait
 
-info "=== Step 10: Verify osdtrace output ==="
+info "=== Step 10: Gather cluster facts for verification ==="
 
-# Resolve the test_pool id once — used by 10.1, 10.3 and 10.4.
+# Resolve once and pass into the shared verifiers — they don't talk to ceph
+# directly, so the test owns this lookup.
 TEST_POOL_ID=$(microceph.ceph osd pool ls detail | grep "^pool.*'test_pool'" | grep -oP "pool \K\d+")
-info "test_pool pool id: $TEST_POOL_ID"
-
-# 10.1 Trace rows captured FOR test_pool specifically.  `osdtrace -p $OSD_PID`
-# also captures internal MicroCeph traffic (.mgr/.osd metadata pools), so a
-# global "no foreign pool ids" check would always fail — what we want to
-# verify is that the rbd-bench traffic for *our* pool reached the BPF
-# program.  Also: counting just "any osd-pg row" wouldn't catch a regression
-# where internal pools alone produce >=50 rows while test_pool produces 0.
-OSD_LINE_COUNT=$(awk -v p_id="$TEST_POOL_ID" \
-    '$1=="osd" && $3=="pg" { split($4, a, "."); if (a[1] == p_id) c++ } END { print c+0 }' \
-    $OSDTRACE_LOG)
-info "osdtrace captured $OSD_LINE_COUNT trace rows for test_pool (pool id $TEST_POOL_ID)"
-if [ $OSD_LINE_COUNT -lt 50 ]; then
-    err "osdtrace did not capture enough trace data for test_pool (expected >= 50 rows, got $OSD_LINE_COUNT)"
-    exit 1
-fi
-
-# 10.2 Check OSD IDs range (global invariant — applies to every captured row
-# regardless of pool).  Use 'osd ls' to get the actual highest OSD ID; OSD
-# numbering may not start at 0.
 MAX_OSD_ID=$(microceph.ceph osd ls | sort -n | tail -1)
-info "Max OSD ID in cluster: $MAX_OSD_ID"
-
-osd_id_err=$(awk -v max_osd=$MAX_OSD_ID '$1=="osd" && ($2 < 0 || $2 > max_osd) {print $2; exit}' $OSDTRACE_LOG)
-if [ -n "$osd_id_err" ]; then
-    err "Found OSD id outside the expected range, $osd_id_err"
-    exit 1
-fi
-
-# 10.3 Check PG ranges in the test pool — restricted to test_pool rows so we
-# don't trip over PGs of internal pools that happen to land on the same OSD.
 TOT_PG=$(microceph.ceph osd pool get test_pool pg_num | awk '{print $2}')
-pg_range_err=$(awk -v p_id="$TEST_POOL_ID" -v tot=$TOT_PG \
-    '$1=="osd" && $3=="pg" {
-        split($4, a, ".")
-        if (a[1] != p_id) next
-        pg = strtonum(a[2])
-        if (pg < 0 || pg >= tot) print a[2]
-    }' $OSDTRACE_LOG)
-if [[ -n $pg_range_err ]]; then
-    err "Found PGs outside the expected range: $pg_range_err"
-    exit 1
-fi
+info "test_pool id: $TEST_POOL_ID, max OSD id: $MAX_OSD_ID, pg_num: $TOT_PG"
 
-# 10.4 Check for high latencies (global invariant — any pool).
-# Maximum acceptable latency value (in microseconds) = 100s.
-# `$NF + 0` forces numeric coercion.  If osdtrace was killed mid-print, the
-# log can end in a truncated record whose last field is a non-numeric
-# fragment (e.g. "s" from a half-emitted "seq_wait").  Without coercion
-# awk falls back to lexicographic comparison: "s" (0x73) > "100000000"
-# (0x31) is true, producing a spurious match on a corruption artifact.
-MAX_LATENCY=100000000
-high_lat=$(awk -v lmax=$MAX_LATENCY '$1=="osd" && $3=="pg" && ($NF + 0) > lmax' $OSDTRACE_LOG)
-if [[ -n $high_lat ]]; then
-    err "Found latencies over $MAX_LATENCY μs"
-    exit 1
-fi
+info "=== Step 11: Verify osdtrace output ==="
+verify_osdtrace_output "$OSDTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" "$TOT_PG" 50
 
-info "✓ All osdtrace output fields validated successfully"
-
-info "=== Step 11: Verify radostrace output ==="
-
-# radostrace column layout (all fields space-separated, leading whitespace trimmed by awk):
-#   $1=pid  $2=client  $3=tid  $4=pool  $5=pg  $6=acting  $7=WR  $8=size  $9=latency  $10+=object[ops]
-# Data rows start with the traced process PID, distinguishing them from the header line:
-# ("pid  client  tid ...")
-# and any status/error messages.
-
-# 11.1 At least 50 data rows captured (see 10.1 for why we count rows
-# instead of all log lines).  Predicate matches the same
-# `$1 ~ /^[0-9]+$/ && NF >= 9` filter used by 11.2/11.3/11.4/11.5 below.
-RADOS_DATA_LINES=$(awk '$1 ~ /^[0-9]+$/ && NF >= 9' $RADOSTRACE_LOG | wc -l)
-info "radostrace captured $RADOS_DATA_LINES trace rows"
-if [ "$RADOS_DATA_LINES" -lt 50 ]; then
-    err "radostrace did not capture enough data (expected >= 50 rows, got $RADOS_DATA_LINES)"
-    exit 1
-fi
-
-# 11.2 Pool IDs ($4) all match test_pool
-# TEST_POOL_ID is already set in step 13.3
-rados_pool_err=$(awk -v p_id="$TEST_POOL_ID" \
-    '$1 ~ /^[0-9]+$/ && NF >= 9 && $4 != p_id { print $4; exit }' \
-    $RADOSTRACE_LOG)
-if [ -n "$rados_pool_err" ]; then
-    err "Unexpected pool id $rados_pool_err in radostrace output (expected $TEST_POOL_ID)"
-    exit 1
-fi
-
-# 11.3 Acting-set OSD IDs ($6) fall within 0..MAX_OSD_ID
-# MAX_OSD_ID is already set in step 13.2
-rados_osd_err=$(awk -v max_osd="$MAX_OSD_ID" \
-    '$1 ~ /^[0-9]+$/ && NF >= 9 {
-        acting = $6; gsub(/[\[\]]/, "", acting)
-        n = split(acting, osds, ",")
-        for (i = 1; i <= n; i++) {
-            id = osds[i] + 0
-            if (id < 0 || id > max_osd) { print id; exit }
-        }
-    }' $RADOSTRACE_LOG)
-if [ -n "$rados_osd_err" ]; then
-    err "Found OSD id $rados_osd_err outside valid range (0..$MAX_OSD_ID) in radostrace output"
-    exit 1
-fi
-
-# 11.4 No latency ($9) exceeds 100 seconds (100,000,000 µs)
-rados_high_lat=$(awk -v lmax="$MAX_LATENCY" \
-    '$1 ~ /^[0-9]+$/ && NF >= 9 && $9 + 0 > lmax { print $9; exit }' \
-    $RADOSTRACE_LOG)
-if [ -n "$rados_high_lat" ]; then
-    err "Found latency ${rados_high_lat} µs exceeding $MAX_LATENCY µs in radostrace output"
-    exit 1
-fi
-
-# 11.5 WR flag ($7) is always "W" (write) or "R" (read)
-rados_flag_err=$(awk \
-    '$1 ~ /^[0-9]+$/ && NF >= 9 && $7 != "W" && $7 != "R" { print $7; exit }' \
-    $RADOSTRACE_LOG)
-if [ -n "$rados_flag_err" ]; then
-    err "Invalid WR flag '$rados_flag_err' in radostrace output (expected W or R)"
-    exit 1
-fi
-
-info "✓ All radostrace output fields validated successfully"
+info "=== Step 12: Verify radostrace output ==="
+verify_radostrace_output "$RADOSTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" 50
 
 info "=== Test Summary ==="
 info "✓ MicroCeph cluster deployed successfully"
-info "✓ osdtrace captured $OSD_LINE_COUNT trace rows"
-info "✓ radostrace captured $RADOS_DATA_LINES trace rows"
+info "✓ osdtrace and radostrace output validated"
 info "✓ All functional tests passed!"
 
 exit 0
