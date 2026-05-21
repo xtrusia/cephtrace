@@ -22,13 +22,13 @@
 # certainly means a timestamp went backwards or the units field is broken.
 TRACE_MAX_LATENCY_US=100000000
 
-# fio --bs used by the functional tests' workload (4 KiB).  At least one
-# radostrace row must report this exact length — anchors the size field to
-# a known constant from the workload, which catches endianness/unit/cast
-# regressions in the BPF length extraction.  Direct 4 KiB IO from fio's rbd
-# engine means most data rows report this size; non-data ops
-# (rbd_object_map updates, header reads, …) report other sizes, which is
-# why the check is "at least one row" rather than "all rows".
+# rbd bench --io-size used by the functional tests' workload (4 KiB).  At
+# least one radostrace row must report this exact length — anchors the size
+# field to a known constant from the workload, which catches
+# endianness/unit/cast regressions in the BPF length extraction.  Random
+# 4 KiB IO means most data rows report this size; metadata ops (header
+# reads, …) report other sizes, which is why the check is "at least one
+# row" rather than "all rows".
 TRACE_EXPECTED_IO_SIZE=4096
 
 
@@ -145,12 +145,15 @@ verify_osdtrace_output() {
 
 # verify_radostrace_output <log> <test_pool_id> <max_osd_id> <min_rows>
 #
-# All invariants below are anchored to the fio PID radostrace is attached
-# to.  The workload (fio --ioengine=rbd --rw=randrw --rwmixread=50 --bs=4k
-# --direct=1) issues both directions through librbd → librados → Objecter,
-# so the W+R diversity check is meaningful.  Disabling librbd cache (set in
-# /etc/ceph/ceph.conf by microceph_setup_client_conf) is what guarantees
-# reads actually reach RADOS rather than getting satisfied locally.
+# All invariants below are anchored to the rbd-bench PID radostrace is
+# attached to.  The workload (microceph.rbd bench --io-type=readwrite
+# --io-pattern=rand --io-size=4K) issues both directions through librbd →
+# librados → Objecter, so the W+R diversity check is meaningful.  Two
+# settings make reads actually reach RADOS rather than getting satisfied
+# locally: the test creates the image with --image-feature layering (no
+# object-map → no client-side short-circuit on unallocated regions), and
+# microceph_disable_rbd_cache turns off librbd's client cache so freshly
+# written data isn't read back from local memory.
 verify_radostrace_output() {
     local log=$1
     local test_pool_id=$2
@@ -214,21 +217,21 @@ verify_radostrace_output() {
         IFS=$IFS_save
 
         # 4. Latency upper bound.  Latency was numeric-coerced in
-        #    _radostrace_rows.  Zero latency is permitted: fio's 4 KiB
-        #    direct IO can complete in sub-microsecond on a local loopback
-        #    cluster, and (finish_stamp - sent_stamp) / 1000 truncates to 0
-        #    for those ops.  That's a legitimate measurement, not a bug.
+        #    _radostrace_rows.  Zero latency is permitted: 4 KiB direct IO
+        #    can complete in sub-microsecond on a local loopback cluster,
+        #    and (finish_stamp - sent_stamp) / 1000 truncates to 0 for
+        #    those ops.  That's a legitimate measurement, not a bug.
         if (( row[latency] > TRACE_MAX_LATENCY_US )); then
             err "Found latency ${row[latency]} µs > $TRACE_MAX_LATENCY_US µs in radostrace output (tid=${row[tid]})"
             return 1
         fi
 
         # 5. Object name matches the workload's expected prefix.  All
-        #    librbd traffic from the fio workload targets `rbd_*` objects
-        #    (rbd_data.*, rbd_header.*, rbd_object_map.*, rbd_id.*,
-        #    rbd_directory).  Catches garbled object-name extraction in
-        #    the BPF helper.  Empty object (NF < 10 in the raw log) is
-        #    rejected by the same regex.
+        #    librbd traffic from the rbd-bench workload targets `rbd_*`
+        #    objects (rbd_data.*, rbd_header.*, rbd_id.*, rbd_directory).
+        #    Catches garbled object-name extraction in the BPF helper.
+        #    Empty object (NF < 10 in the raw log) is rejected by the same
+        #    regex.
         if [[ ! "${row[object]}" =~ ^rbd_ ]]; then
             err "Unexpected object name '${row[object]}' in radostrace output (expected rbd_*, tid=${row[tid]} wr=${row[wr]})"
             return 1
@@ -248,9 +251,10 @@ verify_radostrace_output() {
         return 1
     fi
 
-    # 8. Both W and R must appear — workload (fio --rw=randrw --rwmixread=50)
-    #    issues both directions.  Catches regressions where one direction is
-    #    silently dropped (e.g. a uretprobe missing on the read path).
+    # 8. Both W and R must appear — workload (rbd bench --io-type=readwrite
+    #    --rw-mix-read=50) issues both directions.  Catches regressions
+    #    where one direction is silently dropped (e.g. a uretprobe missing
+    #    on the read path).
     if (( saw_w == 0 )); then
         err "radostrace output has no 'W' rows but workload issued writes"
         return 1
@@ -260,10 +264,10 @@ verify_radostrace_output() {
         return 1
     fi
 
-    # 9. At least one row reported the fio --bs (4 KiB).  Anchors the size
-    #    field to a known workload constant.
+    # 9. At least one row reported the bench --io-size (4 KiB).  Anchors
+    #    the size field to a known workload constant.
     if (( saw_bench_size == 0 )); then
-        err "radostrace output has no row with size=$TRACE_EXPECTED_IO_SIZE (fio --bs)"
+        err "radostrace output has no row with size=$TRACE_EXPECTED_IO_SIZE (rbd bench --io-size)"
         return 1
     fi
 
