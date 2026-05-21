@@ -76,7 +76,24 @@ _radostrace_rows() {
 
 
 # verify_osdtrace_output <log> <test_pool_id> <max_osd_id> <pg_num> <min_rows>
+#
+# The tight per-row loop is wrapped so that shell xtrace (set -x) is
+# silenced during it: under CI the test scripts run with set -x for
+# orchestration visibility, but tracing ~15 commands per row over tens of
+# thousands of rows drowns the runner's log pipe and effectively hangs the
+# job.  xtrace state is restored before return so the caller keeps tracing.
 verify_osdtrace_output() {
+    local _xtrace=0
+    case $- in *x*) _xtrace=1; set +x;; esac
+
+    _verify_osdtrace_output_impl "$@"
+    local rc=$?
+
+    (( _xtrace == 1 )) && set -x
+    return $rc
+}
+
+_verify_osdtrace_output_impl() {
     local log=$1
     local test_pool_id=$2
     local max_osd_id=$3
@@ -154,7 +171,21 @@ verify_osdtrace_output() {
 # object-map → no client-side short-circuit on unallocated regions), and
 # microceph_disable_rbd_cache turns off librbd's client cache so freshly
 # written data isn't read back from local memory.
+#
+# Wrapped the same way as verify_osdtrace_output to silence xtrace during
+# the per-row loop — see that function's header for why.
 verify_radostrace_output() {
+    local _xtrace=0
+    case $- in *x*) _xtrace=1; set +x;; esac
+
+    _verify_radostrace_output_impl "$@"
+    local rc=$?
+
+    (( _xtrace == 1 )) && set -x
+    return $rc
+}
+
+_verify_radostrace_output_impl() {
     local log=$1
     local test_pool_id=$2
     local max_osd_id=$3
