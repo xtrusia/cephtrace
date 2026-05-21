@@ -59,3 +59,41 @@ microceph_setup_single_node() {
     err "Cluster did not become healthy within ${health_timeout}s"
     return 1
 }
+
+# Expose microceph's cluster to host-side librados clients (fio's rbd engine,
+# any other ceph-aware tool running outside snap confinement) by writing
+# /etc/ceph/{ceph.conf,ceph.client.admin.keyring} derived from the snap's
+# internal conf.  Also disables librbd client-side cache so reads always
+# reach RADOS — needed for radostrace to see read-path ops through Objecter.
+microceph_setup_client_conf() {
+    local snap_conf=/var/snap/microceph/current/conf/ceph.conf
+    local snap_keyring=/var/snap/microceph/current/conf/ceph.keyring
+    local etc_conf=/etc/ceph/ceph.conf
+    local etc_keyring=/etc/ceph/ceph.client.admin.keyring
+
+    if [ ! -r "$snap_conf" ] || [ ! -r "$snap_keyring" ]; then
+        err "microceph conf/keyring not readable: $snap_conf / $snap_keyring"
+        return 1
+    fi
+
+    info "Setting up $etc_conf and $etc_keyring for host-side librados..."
+    mkdir -p /etc/ceph
+    cp "$snap_conf" "$etc_conf"
+    cp "$snap_keyring" "$etc_keyring"
+    chmod 0644 "$etc_keyring"
+
+    # The snap's conf points its `keyring =` line at the snap-internal path;
+    # rewrite to the standard /etc/ceph/ path so the conf is self-contained
+    # (and works even if the snap directory layout changes).
+    sed -i "s|$snap_keyring|$etc_keyring|g" "$etc_conf"
+
+    # Disable librbd client-side cache.  Without this, recently-written data
+    # is satisfied from the local cache, so radostrace sees only the write
+    # path and zero reads (Objecter is bypassed).
+    if ! grep -q "^[[:space:]]*\[client\]" "$etc_conf"; then
+        printf '\n[client]\n' >> "$etc_conf"
+    fi
+    if ! grep -q "^[[:space:]]*rbd_cache" "$etc_conf"; then
+        sed -i '/^\[client\]/a rbd_cache = false' "$etc_conf"
+    fi
+}

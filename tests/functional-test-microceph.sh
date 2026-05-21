@@ -29,7 +29,7 @@ cleanup() {
     # Kill any running trace processes
     pkill -f osdtrace || true
     pkill -f radostrace || true
-    pkill -f "rbd bench" || true
+    pkill -x fio || true
 
     if [[ -e $OSDTRACE_LOG ]]; then
         info "OSD trace output:"
@@ -77,6 +77,14 @@ fi
 info "=== Step 1: Setup MicroCeph (install + bootstrap + OSDs + wait healthy) ==="
 if ! microceph_setup_single_node 3 1G 120; then
     err "MicroCeph cluster did not become healthy within timeout"
+    exit 1
+fi
+
+# Expose microceph's conf/keyring at standard /etc/ceph/ paths and disable
+# librbd cache so fio's rbd engine can reach the cluster and reads are not
+# satisfied locally.
+if ! microceph_setup_client_conf; then
+    err "Failed to set up /etc/ceph/ for host-side librados"
     exit 1
 fi
 
@@ -136,64 +144,71 @@ fi
 info "Found OSD process: PID $OSD_PID"
 
 info "=== Step 5: Create RBD pool and image for testing ==="
-# Create RBD pool if it doesn't exist
 if ! microceph.ceph osd pool ls | grep -q "^test_pool$"; then
     microceph.ceph osd pool create test_pool 32
     microceph.ceph osd pool application enable test_pool rbd
 fi
 
-# Create RBD image
-microceph.rbd create test_pool/testimage --size 1G || true
+# Recreate image fresh with only the `layering` feature: drops object-map,
+# which would otherwise short-circuit reads of unallocated regions in the
+# librbd client and hide read-path ops from radostrace.
+microceph.rbd rm test_pool/testimage 2>/dev/null || true
+microceph.rbd create --image-feature layering --size 1G test_pool/testimage
 
 info "=== Step 6: Start osdtrace in background ==="
-timeout 30 $PROJECT_ROOT/osdtrace -i $OSD_DWARF -p $OSD_PID --skip-version-check -x >$OSDTRACE_LOG  2>&1 &
+# Trace runtime is 45 s — needs to outlast fio (30 s) by enough margin that
+# osdtrace stays attached for fio's entire lifetime even though it starts
+# a few seconds earlier.
+timeout 45 $PROJECT_ROOT/osdtrace -i $OSD_DWARF -p $OSD_PID --skip-version-check -x >$OSDTRACE_LOG 2>&1 &
 sleep 2 # ensure osdtrace starts before we get its PID
 OSDTRACE_PID=$(pidof osdtrace)
 info "Started osdtrace with PID $OSDTRACE_PID"
 sleep 3
 
-info "=== Step 7: Generate I/O traffic using rbd bench ==="
-# Mix of reads and writes — radostrace only sees the rbd PID it attaches to,
-# so the bench itself must produce both directions for the W+R diversity
-# check in verify_radostrace_output to be meaningful.
-info "Running rbd bench readwrite..."
-microceph.rbd bench --io-type readwrite --rw-mix-read 50 \
-    --io-size 4M --io-threads 2 --io-total 400M test_pool/testimage &
+info "=== Step 7: Generate I/O traffic via fio (rbd engine) ==="
+# fio drives a random read-write mix directly through librbd's rados engine,
+# 4 KiB direct IO, fixed 30 s runtime, --size capped at 256 MiB to keep
+# allocated objects well below the pool's usable space (~1 GiB with 3 OSDs
+# of 1 GiB and 3× replication).  Output is silenced via --output=/dev/null;
+# any failure surfaces via fio's exit status under `wait` below.
+fio --name=trace_test --ioengine=rbd \
+    --pool=test_pool --rbdname=testimage --clientname=admin \
+    --direct=1 --bs=4k --iodepth=16 \
+    --rw=randrw --rwmixread=50 \
+    --runtime=30 --time_based=1 --size=256M \
+    --norandommap --eta=never \
+    >/tmp/fio.log 2>&1 &
 
 info "=== Step 8: Start radostrace in background ==="
-# microceph.rbd bench runs through a snap wrapper chain (snap-run → snap-confine → rbd).
-# We must find the PID of the actual rbd binary — the only process in that chain that
-# has librados.so.2 mapped into its address space.  Poll /proc/<pid>/maps for each
-# candidate rbd-related process until we find one with librados loaded.
-RBD_ACTUAL_PID=""
+# Find the fio PID with librados.so mapped — fio uses dlopen for its rbd
+# engine, so this confirms the rbd engine actually loaded before we attach.
+FIO_PID=""
 for i in $(seq 1 60); do
-    for pid in $(pgrep -f "rbd" 2>/dev/null); do
+    for pid in $(pgrep -x fio 2>/dev/null); do
         if grep -q "librados" /proc/$pid/maps 2>/dev/null; then
-            RBD_ACTUAL_PID=$pid
+            FIO_PID=$pid
             break 2
         fi
     done
     sleep 0.5
 done
 
-if [ -z "$RBD_ACTUAL_PID" ]; then
-    err "Could not find an rbd process with librados loaded in its maps"
+if [ -z "$FIO_PID" ]; then
+    err "Could not find a fio process with librados loaded in its maps"
+    if [[ -e /tmp/fio.log ]]; then
+        info "fio log so far:"
+        cat /tmp/fio.log
+    fi
     exit 1
 fi
-info "Attaching radostrace to rbd PID $RBD_ACTUAL_PID (confirmed librados-loaded)"
+info "Attaching radostrace to fio PID $FIO_PID (confirmed librados-loaded)"
 
-timeout 30 $PROJECT_ROOT/radostrace -p $RBD_ACTUAL_PID -i $RADOS_DWARF --skip-version-check >$RADOSTRACE_LOG 2>&1 &
+timeout 45 $PROJECT_ROOT/radostrace -p $FIO_PID -i $RADOS_DWARF --skip-version-check >$RADOSTRACE_LOG 2>&1 &
 sleep 2 # ensure radostrace starts before we get its PID
 RADOSTRACE_PID=$(pidof radostrace)
 info "Started radostrace with PID $RADOSTRACE_PID"
 
-# Run some rados operations to generate more librados traffic
-info "Performing rados operations..."
-microceph.rados -p test_pool put testobj /etc/hostname || true
-microceph.rados -p test_pool get testobj /tmp/testobj || true
-microceph.rados -p test_pool rm testobj || true
-
-info "=== Step 9: Wait for all traces to complete"
+info "=== Step 9: Wait for fio + traces to complete"
 wait
 
 info "=== Step 10: Gather cluster facts for verification ==="
@@ -206,10 +221,12 @@ TOT_PG=$(microceph.ceph osd pool get test_pool pg_num | awk '{print $2}')
 info "test_pool id: $TEST_POOL_ID, max OSD id: $MAX_OSD_ID, pg_num: $TOT_PG"
 
 info "=== Step 11: Verify osdtrace output ==="
-verify_osdtrace_output "$OSDTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" "$TOT_PG" 50
+# fio at 4 KiB direct IO produces hundreds-to-thousands of ops/sec, so the
+# row-count thresholds are bumped well above the rbd-bench era (was 50).
+verify_osdtrace_output "$OSDTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" "$TOT_PG" 500
 
 info "=== Step 12: Verify radostrace output ==="
-verify_radostrace_output "$RADOSTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" 50
+verify_radostrace_output "$RADOSTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" 500
 
 info "=== Test Summary ==="
 info "✓ MicroCeph cluster deployed successfully"
