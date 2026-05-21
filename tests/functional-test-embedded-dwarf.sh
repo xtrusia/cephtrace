@@ -7,7 +7,10 @@
 # Exits non-zero on the first failure.
 
 set -e  # Exit on error
-set -x  # Print commands
+# Run with `bash -x ./tests/functional-test-embedded-dwarf.sh` for
+# command-level tracing if you need to debug.  Enabling set -x
+# unconditionally drowns the CI log with per-loop trace lines from the
+# verifier.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -16,6 +19,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/log.sh"
 # shellcheck source=lib/microceph-setup.sh
 source "$SCRIPT_DIR/lib/microceph-setup.sh"
+# shellcheck source=lib/verify-trace-output.sh
+source "$SCRIPT_DIR/lib/verify-trace-output.sh"
 
 OSDTRACE_LOG="/tmp/osdtrace-embedded.log"
 RADOSTRACE_LOG="/tmp/radostrace-embedded.log"
@@ -68,6 +73,14 @@ if ! microceph_setup_single_node 3 1G 120; then
     err "MicroCeph cluster did not become healthy within timeout"
     exit 1
 fi
+
+# Disable librbd cache in microceph's snap conf so reads always reach
+# RADOS (otherwise radostrace would never see the read path).
+if ! microceph_disable_rbd_cache; then
+    err "Failed to disable rbd_cache in microceph's snap conf"
+    exit 1
+fi
+
 microceph.ceph status
 
 info "=== Step 2: Find OSD process PID ==="
@@ -84,24 +97,40 @@ if ! microceph.ceph osd pool ls | grep -q "^test_pool$"; then
     microceph.ceph osd pool create test_pool 32
     microceph.ceph osd pool application enable test_pool rbd
 fi
-microceph.rbd create test_pool/testimage --size 1G || true
+# Recreate image fresh with only the `layering` feature: drops object-map,
+# which would otherwise short-circuit reads of unallocated regions in the
+# librbd client and hide read-path ops from radostrace.
+microceph.rbd rm test_pool/testimage 2>/dev/null || true
+microceph.rbd create --image-feature layering --size 1G test_pool/testimage
 
 info "=== Step 4: Start osdtrace in background (embedded mode, no --import-json) ==="
+# Trace runtime is 30 s — outlasts the bench (20 s) with enough margin to
+# stay attached for its entire lifetime even though osdtrace starts first.
 timeout 30 $PROJECT_ROOT/osdtrace -p $OSD_PID -x >$OSDTRACE_LOG 2>&1 &
 sleep 2 # ensure osdtrace starts before we get its PID
 OSDTRACE_PID=$(pidof osdtrace)
 info "Started osdtrace with PID $OSDTRACE_PID"
 sleep 3
 
-info "=== Step 5: Generate I/O traffic using rbd bench ==="
-info "Running rbd bench write..."
-microceph.rbd bench --io-type write --io-size 4M --io-threads 2 --io-total 400M test_pool/testimage &
+info "=== Step 5: Generate I/O traffic via rbd bench ==="
+# Random 2 MiB read-write mix via the snap-confined rbd bench — runs
+# inside the microceph snap so it picks up the bundled librbd/librados
+# that match our DWARF JSON.  Single thread + 2 MiB blocks keeps the
+# captured-row count to a couple hundred over the 20 s run.
+# `--io-total 100G` is way more than any 20 s run can do; `timeout 20`
+# gives us a fixed runtime instead.
+timeout 20 microceph.rbd bench \
+    --io-type readwrite --rw-mix-read 50 \
+    --io-pattern rand \
+    --io-size 2M --io-threads 1 \
+    --io-total 100G \
+    test_pool/testimage &
 
 info "=== Step 6: Start radostrace in background (embedded mode, no --import-json) ==="
-# microceph.rbd bench runs through a snap wrapper chain (snap-run → snap-confine → rbd).
-# We must find the PID of the actual rbd binary — the only process in that chain that
-# has librados.so.2 mapped into its address space.  Poll /proc/<pid>/maps for each
-# candidate rbd-related process until we find one with librados loaded.
+# microceph.rbd bench runs through a snap wrapper chain (snap-run →
+# snap-confine → rbd).  We must find the PID of the actual rbd binary —
+# the only process in that chain that has librados.so.2 mapped into its
+# address space.  Poll /proc/<pid>/maps for each candidate.
 RBD_ACTUAL_PID=""
 for i in $(seq 1 60); do
     for pid in $(pgrep -f "rbd" 2>/dev/null); do
@@ -124,25 +153,17 @@ sleep 2 # ensure radostrace starts before we get its PID
 RADOSTRACE_PID=$(pidof radostrace)
 info "Started radostrace with PID $RADOSTRACE_PID"
 
-# Run some rados operations to generate more librados traffic
-info "Performing rados operations..."
-microceph.rados -p test_pool put testobj /etc/hostname || true
-microceph.rados -p test_pool get testobj /tmp/testobj || true
-microceph.rados -p test_pool rm testobj || true
-
-info "=== Step 7: Wait for all traces to complete"
+info "=== Step 7: Wait for bench + traces to complete"
 wait
 
-info "=== Step 8: Verify osdtrace output ==="
+info "=== Step 8: Check osdtrace embedded-mode boot marker ==="
 
-# 8.1 Embedded-mode boot marker (UNIQUE to this test).
-# Three outcomes:
+# Embedded-mode boot marker — unique to this test.  Three outcomes:
 #   - Embedded marker present  → expected best path
 #   - Live-parse marker present → osdtrace couldn't detect the Ceph version
 #     (e.g. snap-confined ceph where dpkg lookup fails) and fell back to
-#     runtime DWARF parsing.  This is acceptable: embedded data is an
-#     optimisation, not a correctness requirement, and the rest of the
-#     trace-output validation below still applies.
+#     runtime DWARF parsing.  Acceptable — embedded data is an optimisation,
+#     not a correctness requirement; the field-level checks below still apply.
 #   - Neither marker           → real bug: tool didn't reach either path.
 if grep -q "Using embedded DWARF data" $OSDTRACE_LOG; then
     info "✓ osdtrace used embedded DWARF data"
@@ -153,78 +174,21 @@ else
     exit 1
 fi
 
-# Resolve the test_pool id once — used by 8.2, 8.4 and 8.5.
-TEST_POOL_ID=$(microceph.ceph osd pool ls detail | grep "^pool.*'test_pool'" | grep -oP "pool \K\d+")
-info "test_pool pool id: $TEST_POOL_ID"
+info "=== Step 9: Gather cluster facts for verification ==="
 
-# 8.2 Trace rows captured FOR test_pool specifically.  Threshold deliberately
-# lower than functional-test-microceph.sh (which uses 50).  Embedded mode
+TEST_POOL_ID=$(microceph.ceph osd pool ls detail | grep "^pool.*'test_pool'" | grep -oP "pool \K\d+")
+MAX_OSD_ID=$(microceph.ceph osd ls | sort -n | tail -1)
+TOT_PG=$(microceph.ceph osd pool get test_pool pg_num | awk '{print $2}')
+info "test_pool id: $TEST_POOL_ID, max OSD id: $MAX_OSD_ID, pg_num: $TOT_PG"
+
+info "=== Step 10: Verify osdtrace output ==="
+# min_rows is 20 here vs 50 in functional-test-microceph.sh: embedded mode
 # binds to addresses baked into the binary at build time, so a snap rebuild
 # of the same Ceph version can shift addresses enough that some uprobes fail
 # to attach (-ENOEXEC), legitimately reducing trace volume.
-#
-# Counting test_pool rows (rather than all `osd ... pg ...` rows) is what
-# proves that the rbd-bench traffic generated by Step 5 actually reached
-# the BPF program.  `osdtrace -p $OSD_PID` also captures internal
-# MicroCeph traffic (.mgr/.osd metadata pools), so the check shouldn't be
-# "no foreign pool ids" — it should be "enough rows for *our* pool."
-OSD_LINE_COUNT=$(awk -v p_id="$TEST_POOL_ID" \
-    '$1=="osd" && $3=="pg" { split($4, a, "."); if (a[1] == p_id) c++ } END { print c+0 }' \
-    $OSDTRACE_LOG)
-info "osdtrace captured $OSD_LINE_COUNT trace rows for test_pool (pool id $TEST_POOL_ID)"
-if [ $OSD_LINE_COUNT -lt 20 ]; then
-    err "osdtrace did not capture enough trace data for test_pool (expected >= 20 rows, got $OSD_LINE_COUNT)"
-    exit 1
-fi
+verify_osdtrace_output "$OSDTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" "$TOT_PG" 20
 
-# 8.3 OSD IDs range is within the expected limit (global invariant — applies
-# to every captured row regardless of pool).
-MAX_OSD_ID=$(microceph.ceph osd ls | sort -n | tail -1)
-info "Max OSD ID in cluster: $MAX_OSD_ID"
-
-osd_id_err=$(awk -v max_osd=$MAX_OSD_ID '$1=="osd" && ($2 < 0 || $2 > max_osd) {print $2; exit}' $OSDTRACE_LOG)
-if [ -n "$osd_id_err" ]; then
-    err "Found OSD id outside the expected range, $osd_id_err"
-    exit 1
-fi
-
-# 8.4 PG ranges in the test pool — restricted to test_pool rows so we don't
-# trip over PGs of other pools that happen to be carried by the same OSD.
-TOT_PG=$(microceph.ceph osd pool get test_pool pg_num | awk '{print $2}')
-pg_range_err=$(awk -v p_id="$TEST_POOL_ID" -v tot=$TOT_PG \
-    '$1=="osd" && $3=="pg" {
-        split($4, a, ".")
-        if (a[1] != p_id) next
-        pg = strtonum(a[2])
-        if (pg < 0 || pg >= tot) print a[2]
-    }' $OSDTRACE_LOG)
-if [[ -n $pg_range_err ]]; then
-    err "Found PGs outside the expected range: $pg_range_err"
-    exit 1
-fi
-
-# 8.5 High latencies (max 100s = 100,000,000 µs) — global invariant.
-# `$NF + 0` forces numeric coercion.  If osdtrace was killed mid-print, the
-# log can end in a truncated record whose last field is a non-numeric
-# fragment (e.g. "s" from a half-emitted "seq_wait").  Without coercion
-# awk falls back to lexicographic comparison: "s" (0x73) > "100000000"
-# (0x31) is true, producing a spurious match on a corruption artifact.
-MAX_LATENCY=100000000
-high_lat=$(awk -v lmax=$MAX_LATENCY '$1=="osd" && $3=="pg" && ($NF + 0) > lmax' $OSDTRACE_LOG)
-if [[ -n $high_lat ]]; then
-    err "Found latencies over $MAX_LATENCY μs"
-    exit 1
-fi
-
-info "✓ All osdtrace output fields validated successfully"
-
-info "=== Step 9: Verify radostrace output ==="
-
-# radostrace column layout (all fields space-separated, leading whitespace trimmed by awk):
-#   $1=pid  $2=client  $3=tid  $4=pool  $5=pg  $6=acting  $7=WR  $8=size  $9=latency  $10+=object[ops]
-# Data rows start with the traced process PID, distinguishing them from the header line.
-
-# 9.1 Embedded-mode boot marker (see 8.1 for rationale on the 3-way split).
+info "=== Step 11: Check radostrace embedded-mode boot marker ==="
 if grep -q "Using embedded DWARF data" $RADOSTRACE_LOG; then
     info "✓ radostrace used embedded DWARF data"
 elif grep -q "Start to parse dwarf info" $RADOSTRACE_LOG; then
@@ -234,65 +198,12 @@ else
     exit 1
 fi
 
-# 9.2 At least 20 data rows captured (see 8.2 for why this is lower than
-# func-test, and why we count rows instead of all log lines).  Filter
-# matches the same `$1 ~ /^[0-9]+$/ && NF >= 9` predicate used by
-# 9.3/9.4/9.5/9.6 below.
-RADOS_DATA_LINES=$(awk '$1 ~ /^[0-9]+$/ && NF >= 9' $RADOSTRACE_LOG | wc -l)
-info "radostrace captured $RADOS_DATA_LINES trace rows"
-if [ "$RADOS_DATA_LINES" -lt 20 ]; then
-    err "radostrace did not capture enough data (expected >= 20 rows, got $RADOS_DATA_LINES)"
-    exit 1
-fi
-
-# 9.3 Pool IDs ($4) all match test_pool (TEST_POOL_ID set in 8.4)
-rados_pool_err=$(awk -v p_id="$TEST_POOL_ID" \
-    '$1 ~ /^[0-9]+$/ && NF >= 9 && $4 != p_id { print $4; exit }' \
-    $RADOSTRACE_LOG)
-if [ -n "$rados_pool_err" ]; then
-    err "Unexpected pool id $rados_pool_err in radostrace output (expected $TEST_POOL_ID)"
-    exit 1
-fi
-
-# 9.4 Acting-set OSD IDs ($6) fall within 0..MAX_OSD_ID (set in 8.3)
-rados_osd_err=$(awk -v max_osd="$MAX_OSD_ID" \
-    '$1 ~ /^[0-9]+$/ && NF >= 9 {
-        acting = $6; gsub(/[\[\]]/, "", acting)
-        n = split(acting, osds, ",")
-        for (i = 1; i <= n; i++) {
-            id = osds[i] + 0
-            if (id < 0 || id > max_osd) { print id; exit }
-        }
-    }' $RADOSTRACE_LOG)
-if [ -n "$rados_osd_err" ]; then
-    err "Found OSD id $rados_osd_err outside valid range (0..$MAX_OSD_ID) in radostrace output"
-    exit 1
-fi
-
-# 9.5 No latency ($9) exceeds 100 seconds (MAX_LATENCY set in 8.6)
-rados_high_lat=$(awk -v lmax="$MAX_LATENCY" \
-    '$1 ~ /^[0-9]+$/ && NF >= 9 && $9 + 0 > lmax { print $9; exit }' \
-    $RADOSTRACE_LOG)
-if [ -n "$rados_high_lat" ]; then
-    err "Found latency ${rados_high_lat} µs exceeding $MAX_LATENCY µs in radostrace output"
-    exit 1
-fi
-
-# 9.6 WR flag ($7) is always "W" (write) or "R" (read)
-rados_flag_err=$(awk \
-    '$1 ~ /^[0-9]+$/ && NF >= 9 && $7 != "W" && $7 != "R" { print $7; exit }' \
-    $RADOSTRACE_LOG)
-if [ -n "$rados_flag_err" ]; then
-    err "Invalid WR flag '$rados_flag_err' in radostrace output (expected W or R)"
-    exit 1
-fi
-
-info "✓ All radostrace output fields validated successfully"
+info "=== Step 12: Verify radostrace output ==="
+verify_radostrace_output "$RADOSTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" 20
 
 info "=== Test Summary ==="
 info "✓ MicroCeph cluster deployed successfully"
-info "✓ osdtrace captured $OSD_LINE_COUNT trace rows (see Step 8.1 for embedded vs fallback path)"
-info "✓ radostrace captured $RADOS_DATA_LINES trace rows (see Step 9.1 for embedded vs fallback path)"
+info "✓ osdtrace and radostrace output validated (see Steps 8/11 for embedded vs fallback path)"
 info "✓ All E2E checks passed!"
 
 exit 0

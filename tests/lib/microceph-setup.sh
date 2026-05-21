@@ -59,3 +59,30 @@ microceph_setup_single_node() {
     err "Cluster did not become healthy within ${health_timeout}s"
     return 1
 }
+
+# Disable librbd client-side cache in microceph's snap-internal ceph.conf.
+# Without this, reads of recently-written data are satisfied locally inside
+# librbd's cache and never reach RADOS — so radostrace's uprobes on
+# Objecter::_send_op / _finish_op never fire on the read path.  The image
+# also needs `--image-feature layering` (no object-map) for reads of
+# unallocated regions to reach RADOS; the two together close all the
+# client-side short-circuits we know of.
+microceph_disable_rbd_cache() {
+    local conf=/var/snap/microceph/current/conf/ceph.conf
+
+    if [ ! -w "$conf" ]; then
+        err "microceph conf $conf not writable (need root?)"
+        return 1
+    fi
+
+    if grep -q "^[[:space:]]*rbd_cache" "$conf"; then
+        info "rbd_cache already configured in $conf"
+        return 0
+    fi
+
+    info "Appending rbd_cache=false to $conf (trace visibility for reads)"
+    if ! grep -q "^[[:space:]]*\[client\]" "$conf"; then
+        printf '\n[client]\n' >> "$conf"
+    fi
+    sed -i '/^\[client\]/a rbd_cache = false' "$conf"
+}
