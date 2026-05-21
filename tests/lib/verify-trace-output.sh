@@ -22,14 +22,14 @@
 # certainly means a timestamp went backwards or the units field is broken.
 TRACE_MAX_LATENCY_US=100000000
 
-# rbd bench --io-size used by the functional tests' workload (512 KiB).
+# rbd bench --io-size used by the functional tests' workload (2 MiB).
 # At least one radostrace row must report this exact length — anchors the
 # size field to a known constant from the workload, which catches
 # endianness/unit/cast regressions in the BPF length extraction.  Random
-# 512 KiB IO means most data rows report this size; metadata ops
-# (header reads, …) report other sizes, which is why the check is "at
-# least one row" rather than "all rows".
-TRACE_EXPECTED_IO_SIZE=524288
+# 2 MiB IO means most data rows report this size; metadata ops (header
+# reads, …) report other sizes, which is why the check is "at least one
+# row" rather than "all rows".
+TRACE_EXPECTED_IO_SIZE=2097152
 
 
 # _osdtrace_rows <log>
@@ -165,9 +165,8 @@ _verify_osdtrace_output_impl() {
 #
 # All invariants below are anchored to the rbd-bench PID radostrace is
 # attached to.  The workload (microceph.rbd bench --io-type=readwrite
-# --io-pattern=rand --io-size=512K) issues both directions through
-# librbd → librados → Objecter, so the W+R diversity check is
-# meaningful.  Two
+# --io-pattern=rand --io-size=2M) issues both directions through librbd
+# → librados → Objecter, so the W+R diversity check is meaningful.  Two
 # settings make reads actually reach RADOS rather than getting satisfied
 # locally: the test creates the image with --image-feature layering (no
 # object-map → no client-side short-circuit on unallocated regions), and

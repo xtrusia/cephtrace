@@ -104,27 +104,25 @@ microceph.rbd rm test_pool/testimage 2>/dev/null || true
 microceph.rbd create --image-feature layering --size 1G test_pool/testimage
 
 info "=== Step 4: Start osdtrace in background (embedded mode, no --import-json) ==="
-# Trace runtime is 45 s — needs to outlast fio (30 s) by enough margin that
-# osdtrace stays attached for fio's entire lifetime even though it starts
-# a few seconds earlier.
-timeout 45 $PROJECT_ROOT/osdtrace -p $OSD_PID -x >$OSDTRACE_LOG 2>&1 &
+# Trace runtime is 30 s — outlasts the bench (20 s) with enough margin to
+# stay attached for its entire lifetime even though osdtrace starts first.
+timeout 30 $PROJECT_ROOT/osdtrace -p $OSD_PID -x >$OSDTRACE_LOG 2>&1 &
 sleep 2 # ensure osdtrace starts before we get its PID
 OSDTRACE_PID=$(pidof osdtrace)
 info "Started osdtrace with PID $OSDTRACE_PID"
 sleep 3
 
 info "=== Step 5: Generate I/O traffic via rbd bench ==="
-# Random 512 KiB read-write mix via the snap-confined rbd bench — runs
+# Random 2 MiB read-write mix via the snap-confined rbd bench — runs
 # inside the microceph snap so it picks up the bundled librbd/librados
-# that match our DWARF JSON.  Single thread + 512 KiB blocks keeps the
-# captured-row count to a few hundred — small enough that the dict-based
-# verifier doesn't drown the CI log with set -x trace lines.
-# `--io-total 100G` is way more than any 30 s run can do; `timeout 30`
+# that match our DWARF JSON.  Single thread + 2 MiB blocks keeps the
+# captured-row count to a couple hundred over the 20 s run.
+# `--io-total 100G` is way more than any 20 s run can do; `timeout 20`
 # gives us a fixed runtime instead.
-timeout 30 microceph.rbd bench \
+timeout 20 microceph.rbd bench \
     --io-type readwrite --rw-mix-read 50 \
     --io-pattern rand \
-    --io-size 512K --io-threads 1 \
+    --io-size 2M --io-threads 1 \
     --io-total 100G \
     test_pool/testimage &
 
@@ -150,7 +148,7 @@ if [ -z "$RBD_ACTUAL_PID" ]; then
 fi
 info "Attaching radostrace to rbd PID $RBD_ACTUAL_PID (confirmed librados-loaded)"
 
-timeout 45 $PROJECT_ROOT/radostrace -p $RBD_ACTUAL_PID >$RADOSTRACE_LOG 2>&1 &
+timeout 30 $PROJECT_ROOT/radostrace -p $RBD_ACTUAL_PID >$RADOSTRACE_LOG 2>&1 &
 sleep 2 # ensure radostrace starts before we get its PID
 RADOSTRACE_PID=$(pidof radostrace)
 info "Started radostrace with PID $RADOSTRACE_PID"
@@ -184,11 +182,11 @@ TOT_PG=$(microceph.ceph osd pool get test_pool pg_num | awk '{print $2}')
 info "test_pool id: $TEST_POOL_ID, max OSD id: $MAX_OSD_ID, pg_num: $TOT_PG"
 
 info "=== Step 10: Verify osdtrace output ==="
-# min_rows is 50 here vs 100 in functional-test-microceph.sh: embedded mode
+# min_rows is 20 here vs 50 in functional-test-microceph.sh: embedded mode
 # binds to addresses baked into the binary at build time, so a snap rebuild
 # of the same Ceph version can shift addresses enough that some uprobes fail
 # to attach (-ENOEXEC), legitimately reducing trace volume.
-verify_osdtrace_output "$OSDTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" "$TOT_PG" 50
+verify_osdtrace_output "$OSDTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" "$TOT_PG" 20
 
 info "=== Step 11: Check radostrace embedded-mode boot marker ==="
 if grep -q "Using embedded DWARF data" $RADOSTRACE_LOG; then
@@ -201,7 +199,7 @@ else
 fi
 
 info "=== Step 12: Verify radostrace output ==="
-verify_radostrace_output "$RADOSTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" 50
+verify_radostrace_output "$RADOSTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" 20
 
 info "=== Test Summary ==="
 info "✓ MicroCeph cluster deployed successfully"

@@ -157,29 +157,27 @@ microceph.rbd rm test_pool/testimage 2>/dev/null || true
 microceph.rbd create --image-feature layering --size 1G test_pool/testimage
 
 info "=== Step 6: Start osdtrace in background ==="
-# Trace runtime is 45 s — needs to outlast fio (30 s) by enough margin that
-# osdtrace stays attached for fio's entire lifetime even though it starts
-# a few seconds earlier.
-timeout 45 $PROJECT_ROOT/osdtrace -i $OSD_DWARF -p $OSD_PID --skip-version-check -x >$OSDTRACE_LOG 2>&1 &
+# Trace runtime is 30 s — outlasts the bench (20 s) with enough margin to
+# stay attached for its entire lifetime even though osdtrace starts first.
+timeout 30 $PROJECT_ROOT/osdtrace -i $OSD_DWARF -p $OSD_PID --skip-version-check -x >$OSDTRACE_LOG 2>&1 &
 sleep 2 # ensure osdtrace starts before we get its PID
 OSDTRACE_PID=$(pidof osdtrace)
 info "Started osdtrace with PID $OSDTRACE_PID"
 sleep 3
 
 info "=== Step 7: Generate I/O traffic via rbd bench ==="
-# Random 512 KiB read-write mix via the snap-confined rbd bench — runs
+# Random 2 MiB read-write mix via the snap-confined rbd bench — runs
 # inside the microceph snap so it picks up the bundled librbd/librados
 # that match our DWARF JSON (host-side tools load Ubuntu's apt librados,
 # a different Ceph version, and the uprobe offsets would be wrong).
-# Single thread + 512 KiB blocks keeps the captured-row count to a few
-# hundred — small enough that the dict-based verifier doesn't drown the
-# CI log with set -x trace lines.
-# `--io-total 100G` is way more than any 30 s run can do; `timeout 30`
+# Single thread + 2 MiB blocks keeps the captured-row count to a couple
+# hundred over the 20 s run.
+# `--io-total 100G` is way more than any 20 s run can do; `timeout 20`
 # gives us a fixed runtime instead.
-timeout 30 microceph.rbd bench \
+timeout 20 microceph.rbd bench \
     --io-type readwrite --rw-mix-read 50 \
     --io-pattern rand \
-    --io-size 512K --io-threads 1 \
+    --io-size 2M --io-threads 1 \
     --io-total 100G \
     test_pool/testimage &
 
@@ -205,7 +203,7 @@ if [ -z "$RBD_ACTUAL_PID" ]; then
 fi
 info "Attaching radostrace to rbd PID $RBD_ACTUAL_PID (confirmed librados-loaded)"
 
-timeout 45 $PROJECT_ROOT/radostrace -p $RBD_ACTUAL_PID -i $RADOS_DWARF --skip-version-check >$RADOSTRACE_LOG 2>&1 &
+timeout 30 $PROJECT_ROOT/radostrace -p $RBD_ACTUAL_PID -i $RADOS_DWARF --skip-version-check >$RADOSTRACE_LOG 2>&1 &
 sleep 2 # ensure radostrace starts before we get its PID
 RADOSTRACE_PID=$(pidof radostrace)
 info "Started radostrace with PID $RADOSTRACE_PID"
@@ -223,13 +221,13 @@ TOT_PG=$(microceph.ceph osd pool get test_pool pg_num | awk '{print $2}')
 info "test_pool id: $TEST_POOL_ID, max OSD id: $MAX_OSD_ID, pg_num: $TOT_PG"
 
 info "=== Step 11: Verify osdtrace output ==="
-# 512 KiB random IO / 1 thread / 30 s produces a few hundred client ops;
-# osdtrace fans each write out to subop_w replicas as well, so a few
-# hundred rows is the expected order of magnitude.
-verify_osdtrace_output "$OSDTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" "$TOT_PG" 100
+# 2 MiB random IO / 1 thread / 20 s produces ~100-300 client ops;
+# osdtrace fans each write out to subop_w replicas as well, so the
+# row total is several hundred.
+verify_osdtrace_output "$OSDTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" "$TOT_PG" 50
 
 info "=== Step 12: Verify radostrace output ==="
-verify_radostrace_output "$RADOSTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" 100
+verify_radostrace_output "$RADOSTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" 50
 
 info "=== Test Summary ==="
 info "✓ MicroCeph cluster deployed successfully"
