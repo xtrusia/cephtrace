@@ -7,7 +7,10 @@
 # Exits non-zero on the first failure.
 
 set -e  # Exit on error
-set -x  # Print commands
+# Run with `bash -x ./tests/functional-test-embedded-dwarf.sh` for
+# command-level tracing if you need to debug.  Enabling set -x
+# unconditionally drowns the CI log with per-loop trace lines from the
+# verifier.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
