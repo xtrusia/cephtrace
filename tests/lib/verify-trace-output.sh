@@ -22,14 +22,14 @@
 # certainly means a timestamp went backwards or the units field is broken.
 TRACE_MAX_LATENCY_US=100000000
 
-# rbd bench --io-size used by the functional tests' workload (4 KiB).  At
-# least one radostrace row must report this exact length — anchors the size
-# field to a known constant from the workload, which catches
+# rbd bench --io-size used by the functional tests' workload (512 KiB).
+# At least one radostrace row must report this exact length — anchors the
+# size field to a known constant from the workload, which catches
 # endianness/unit/cast regressions in the BPF length extraction.  Random
-# 4 KiB IO means most data rows report this size; metadata ops (header
-# reads, …) report other sizes, which is why the check is "at least one
-# row" rather than "all rows".
-TRACE_EXPECTED_IO_SIZE=4096
+# 512 KiB IO means most data rows report this size; metadata ops
+# (header reads, …) report other sizes, which is why the check is "at
+# least one row" rather than "all rows".
+TRACE_EXPECTED_IO_SIZE=524288
 
 
 # _osdtrace_rows <log>
@@ -164,8 +164,9 @@ _verify_osdtrace_output_impl() {
 #
 # All invariants below are anchored to the rbd-bench PID radostrace is
 # attached to.  The workload (microceph.rbd bench --io-type=readwrite
-# --io-pattern=rand --io-size=4K) issues both directions through librbd →
-# librados → Objecter, so the W+R diversity check is meaningful.  Two
+# --io-pattern=rand --io-size=512K) issues both directions through
+# librbd → librados → Objecter, so the W+R diversity check is
+# meaningful.  Two
 # settings make reads actually reach RADOS rather than getting satisfied
 # locally: the test creates the image with --image-feature layering (no
 # object-map → no client-side short-circuit on unallocated regions), and
@@ -248,10 +249,10 @@ _verify_radostrace_output_impl() {
         IFS=$IFS_save
 
         # 4. Latency upper bound.  Latency was numeric-coerced in
-        #    _radostrace_rows.  Zero latency is permitted: 4 KiB direct IO
-        #    can complete in sub-microsecond on a local loopback cluster,
-        #    and (finish_stamp - sent_stamp) / 1000 truncates to 0 for
-        #    those ops.  That's a legitimate measurement, not a bug.
+        #    _radostrace_rows.  Zero latency is permitted: a small IO can
+        #    complete in sub-microsecond on a local loopback cluster, and
+        #    (finish_stamp - sent_stamp) / 1000 truncates to 0 for those
+        #    ops.  That's a legitimate measurement, not a bug.
         if (( row[latency] > TRACE_MAX_LATENCY_US )); then
             err "Found latency ${row[latency]} µs > $TRACE_MAX_LATENCY_US µs in radostrace output (tid=${row[tid]})"
             return 1

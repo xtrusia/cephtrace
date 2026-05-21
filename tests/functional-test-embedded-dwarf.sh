@@ -111,16 +111,17 @@ info "Started osdtrace with PID $OSDTRACE_PID"
 sleep 3
 
 info "=== Step 5: Generate I/O traffic via rbd bench ==="
-# Random 4 KiB read-write mix via the snap-confined rbd bench — runs inside
-# the microceph snap so it picks up the bundled librbd/librados that match
-# our DWARF JSON (host-side tools load Ubuntu's apt librados, a different
-# Ceph version, and the uprobe offsets would be wrong).
+# Random 512 KiB read-write mix via the snap-confined rbd bench — runs
+# inside the microceph snap so it picks up the bundled librbd/librados
+# that match our DWARF JSON.  Single thread + 512 KiB blocks keeps the
+# captured-row count to a few hundred — small enough that the dict-based
+# verifier doesn't drown the CI log with set -x trace lines.
 # `--io-total 100G` is way more than any 30 s run can do; `timeout 30`
 # gives us a fixed runtime instead.
 timeout 30 microceph.rbd bench \
     --io-type readwrite --rw-mix-read 50 \
     --io-pattern rand \
-    --io-size 4K --io-threads 16 \
+    --io-size 512K --io-threads 1 \
     --io-total 100G \
     test_pool/testimage &
 
@@ -180,11 +181,11 @@ TOT_PG=$(microceph.ceph osd pool get test_pool pg_num | awk '{print $2}')
 info "test_pool id: $TEST_POOL_ID, max OSD id: $MAX_OSD_ID, pg_num: $TOT_PG"
 
 info "=== Step 10: Verify osdtrace output ==="
-# min_rows is 200 here vs 500 in functional-test-microceph.sh: embedded mode
+# min_rows is 50 here vs 100 in functional-test-microceph.sh: embedded mode
 # binds to addresses baked into the binary at build time, so a snap rebuild
 # of the same Ceph version can shift addresses enough that some uprobes fail
 # to attach (-ENOEXEC), legitimately reducing trace volume.
-verify_osdtrace_output "$OSDTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" "$TOT_PG" 200
+verify_osdtrace_output "$OSDTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" "$TOT_PG" 50
 
 info "=== Step 11: Check radostrace embedded-mode boot marker ==="
 if grep -q "Using embedded DWARF data" $RADOSTRACE_LOG; then
@@ -197,7 +198,7 @@ else
 fi
 
 info "=== Step 12: Verify radostrace output ==="
-verify_radostrace_output "$RADOSTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" 200
+verify_radostrace_output "$RADOSTRACE_LOG" "$TEST_POOL_ID" "$MAX_OSD_ID" 50
 
 info "=== Test Summary ==="
 info "✓ MicroCeph cluster deployed successfully"
