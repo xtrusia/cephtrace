@@ -42,6 +42,36 @@ jobs:
       - name: Embedded DWARF data test - verify integrity and E2E
         run: sudo ./tests/functional-test-embedded-dwarf.sh
 
+  build-ubuntu-cephadm:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        release: [quincy, reef, squid, tentacle]
+    steps:
+      - name: Checkout code and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+            sudo apt-get update
+            sudo apt-get install -y g++ clang libelf-dev libc6-dev-i386 libdw-dev python3
+
+      - name: Run Makefile build
+        run: make -j all
+
+      - name: Functional test - cephadm + radosgw (${{ matrix.release }})
+        # The script provisions a single-host cephadm cluster (1 MON+MGR,
+        # 3 LVM-wrapped loopback OSDs, 1 radosgw), drives S3 traffic, then
+        # traces both the radosgw and one OSD with the matching embedded
+        # DWARF data.  Self-contained: installs podman/s3cmd/lvm2 itself.
+        run: sudo ./tests/functional-test-cephadm-rgw.sh ${{ matrix.release }}
+
   build-ubuntu-arm64:
     runs-on: ubuntu-24.04-arm
     steps:

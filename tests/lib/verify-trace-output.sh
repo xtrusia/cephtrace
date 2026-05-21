@@ -306,3 +306,121 @@ _verify_radostrace_output_impl() {
 
     info "✓ All radostrace output fields validated successfully"
 }
+
+
+# verify_osdtrace_rgw_output <log> <data_pool_id> <max_osd_id> <data_pool_pg_num> <min_rows>
+#
+# Variant of verify_osdtrace_output for RGW-driven workloads (S3 PUT/GET via
+# `radosgw`).  Same per-row invariants -- OSD id range, latency upper bound,
+# PG-within-pg_num -- but anchored to the data pool the RGW writes object
+# payloads into (typically `default.rgw.buckets.data`) rather than a single
+# user-created pool.  RGW also generates traffic to several internal pools
+# (.rgw.meta, .rgw.buckets.index, .rgw.log, ...); those rows are ignored
+# for the per-pool checks since their pg_num values differ.
+verify_osdtrace_rgw_output() {
+    # Implementation re-uses the rbd-bench verifier's row loop; the per-pool
+    # filter already restricts the PG check + row count to the named pool,
+    # which is exactly the semantics we want for RGW.
+    verify_osdtrace_output "$@"
+}
+
+
+# verify_radostrace_rgw_output <log> <max_osd_id> <min_rows>
+#
+# Variant of verify_radostrace_output for RGW-driven workloads.  Drops three
+# rbd-bench-specific checks that do not apply to RGW traffic:
+#   - pool id pin: RGW sprays across .rgw.meta / .rgw.buckets.index /
+#     .rgw.buckets.data / .rgw.log; there is no single canonical pool.
+#   - `^rbd_` object name prefix: RGW objects are
+#     `<bucket-marker>_<oid>` / `_shadow_.<…>` / `meta.head:user.<…>` etc.
+#   - 2 MiB IO size anchor: the S3 PUT workload uses randomised sizes.
+#
+# Kept (pool-agnostic) invariants:
+#   - row count >= min_rows
+#   - WR flag is W or R, both directions observed
+#   - every OSD id in the acting set within [0, max_osd_id]
+#   - latency <= TRACE_MAX_LATENCY_US
+verify_radostrace_rgw_output() {
+    local _xtrace=0
+    case $- in *x*) _xtrace=1; set +x;; esac
+
+    _verify_radostrace_rgw_output_impl "$@"
+    local rc=$?
+
+    (( _xtrace == 1 )) && set -x
+    return $rc
+}
+
+_verify_radostrace_rgw_output_impl() {
+    local log=$1
+    local max_osd_id=$2
+    local min_rows=$3
+
+    local total=0
+    local saw_w=0 saw_r=0
+    local -A row
+    local pid client tid pool pg acting wr size latency object
+    local acting_inner osd_id_str osd_id
+
+    while IFS='|' read -r pid client tid pool pg acting wr size latency object; do
+        [ -z "$pid" ] && continue
+
+        row=(
+            [pid]="$pid"
+            [client]="$client"
+            [tid]="$tid"
+            [pool]="$pool"
+            [pg]="$pg"
+            [acting]="$acting"
+            [wr]="$wr"
+            [size]="$size"
+            [latency]="$latency"
+            [object]="$object"
+        )
+        total=$((total + 1))
+
+        case "${row[wr]}" in
+            W) saw_w=1 ;;
+            R) saw_r=1 ;;
+            *) err "Invalid WR flag '${row[wr]}' in radostrace output (expected W or R, tid=${row[tid]})"
+               return 1 ;;
+        esac
+
+        acting_inner=${row[acting]#\[}
+        acting_inner=${acting_inner%\]}
+        local IFS_save=$IFS
+        IFS=','
+        # shellcheck disable=SC2086  # intentional word-split on commas
+        for osd_id_str in $acting_inner; do
+            osd_id=$((osd_id_str))
+            if (( osd_id < 0 || osd_id > max_osd_id )); then
+                IFS=$IFS_save
+                err "OSD id $osd_id in acting set ${row[acting]} outside valid range [0, $max_osd_id] (tid=${row[tid]})"
+                return 1
+            fi
+        done
+        IFS=$IFS_save
+
+        if (( row[latency] > TRACE_MAX_LATENCY_US )); then
+            err "Found latency ${row[latency]} µs > $TRACE_MAX_LATENCY_US µs in radostrace output (tid=${row[tid]})"
+            return 1
+        fi
+    done < <(_radostrace_rows "$log")
+
+    info "radostrace captured $total trace rows from RGW workload"
+    if (( total < min_rows )); then
+        err "radostrace did not capture enough data (expected >= $min_rows rows, got $total)"
+        return 1
+    fi
+
+    if (( saw_w == 0 )); then
+        err "radostrace output has no 'W' rows but workload issued PUTs"
+        return 1
+    fi
+    if (( saw_r == 0 )); then
+        err "radostrace output has no 'R' rows but workload issued GETs"
+        return 1
+    fi
+
+    info "✓ All radostrace output fields validated successfully"
+}
