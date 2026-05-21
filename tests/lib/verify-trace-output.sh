@@ -59,17 +59,18 @@ _osdtrace_rows() {
 #
 # Stream pipe-separated radostrace data rows to stdout, one per line:
 #   pid|client|tid|pool|pg|acting|wr|size|latency|object
-# Data rows start with a numeric PID (the traced process's PID).  Filter
-# `$1 ~ /^[0-9]+$/ && NF >= 9` rejects the header line ("pid client … "),
-# status messages, and tool-emitted log noise.  $10 may be missing on a
-# malformed row — emitted as the empty string so the downstream regex
-# check fails loudly rather than silently skipping.
+# Data rows start with a numeric PID (the traced process's PID).  Predicate
+# `$1 ~ /^[0-9]+$/ && NF >= 10` rejects the header line ("pid client … "),
+# status messages, tool log noise, and — importantly — any truncated tail
+# record left behind when SIGKILL hits radostrace mid-printf (after the
+# latency field but before object_name).  Numeric coercion on $8/$9
+# guards against the same kind of partial-write artifact appearing in
+# the size/latency fields.
 _radostrace_rows() {
     awk '
-        $1 ~ /^[0-9]+$/ && NF >= 9 {
-            obj = (NF >= 10) ? $10 : ""
+        $1 ~ /^[0-9]+$/ && NF >= 10 {
             print $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" \
-                  ($8 + 0) "|" ($9 + 0) "|" obj
+                  ($8 + 0) "|" ($9 + 0) "|" $10
         }
     ' "$1"
 }
@@ -262,8 +263,9 @@ _verify_radostrace_output_impl() {
         #    librbd traffic from the rbd-bench workload targets `rbd_*`
         #    objects (rbd_data.*, rbd_header.*, rbd_id.*, rbd_directory).
         #    Catches garbled object-name extraction in the BPF helper.
-        #    Empty object (NF < 10 in the raw log) is rejected by the same
-        #    regex.
+        #    Truncated tail records (where radostrace was killed before
+        #    printing the object name) are filtered upstream by the NF >=
+        #    10 predicate in _radostrace_rows.
         if [[ ! "${row[object]}" =~ ^rbd_ ]]; then
             err "Unexpected object name '${row[object]}' in radostrace output (expected rbd_*, tid=${row[tid]} wr=${row[wr]})"
             return 1
