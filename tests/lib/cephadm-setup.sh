@@ -132,6 +132,10 @@ cephadm_bootstrap_single_host() {
     # from a different Ceph release than the target image (e.g. Ubuntu
     # 24.04 ships squid-era cephadm, but we may want to bootstrap a reef
     # or quincy cluster).  cephadm refuses to proceed otherwise.
+    # --no-cleanup-on-failure would let us inspect a partial bootstrap, but
+    # it was added later in the quincy line and the apt-installed cephadm
+    # on Ubuntu 22.04 rejects it.  CI doesn't need the inspection anyway —
+    # the default (auto-cleanup on failed bootstrap) is what we want there.
     "$cephadm_bin" --image "$image" bootstrap \
         --mon-ip "$mon_ip" \
         --skip-mon-network \
@@ -140,7 +144,6 @@ cephadm_bootstrap_single_host() {
         --single-host-defaults \
         --allow-overwrite \
         --allow-mismatched-release \
-        --no-cleanup-on-failure \
         >&2
     ls /var/lib/ceph/ 2>/dev/null | grep -E '^[0-9a-f]{8}-[0-9a-f-]+$' | head -1
 }
