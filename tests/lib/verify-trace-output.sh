@@ -65,42 +65,58 @@ TRACE_EXPECTED_IO_SIZE=2097152
 # Same logic drops rows with the `[delayed%d ... ]` continuation tokens
 # appended (their NF is inflated past the expected count).
 _osdtrace_rows() {
+    # The "prev" buffer + END (no flush of prev) makes the LAST data row
+    # the parser would otherwise emit get dropped.  Defense-in-depth on
+    # top of the NF/landmark check: if SIGKILL hits osdtrace mid-printf
+    # at a buffer-flush boundary (libc splitting a large stdio flush
+    # across multiple write() syscalls), the byte-truncation can land
+    # somewhere the strict NF/landmark check still happens to accept.
+    # Skipping the last emit closes that corner.  Cost: one good row per
+    # trace, against thousands captured.
     awk '
         function num(s,   _t) { _t = s; gsub(/[^0-9-]/, "", _t); return _t + 0 }
+        function flush_pending() { if (prev != "") { print prev; prev = "" } }
 
         $1 == "osd" && $3 == "pg" && \
         $2 ~ /^-?[0-9]+$/ && \
         $4 ~ /^[0-9]+\.[0-9a-fA-F]+$/ {
             split($4, pg, ".")
             op = $5
+            candidate = ""
             if (op == "op_r" && NF == 25 && \
                 $6 == "size" && $24 == "op_lat") {
-                printf "op_r|%d|%s|%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d\n", \
+                candidate = sprintf("op_r|%d|%s|%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d", \
                     $2, pg[1], pg[2], \
                     $7, $9, $11, \
                     $13, $15, $17, $19, $21, \
-                    $23, $25
+                    $23, $25)
             } else if (op == "subop_w" && NF == 35 && \
                        $22 == "bluestore_lat" && $24 == "(prepare" && \
                        $34 == "subop_lat") {
-                printf "subop_w|%d|%s|%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d\n", \
+                candidate = sprintf("subop_w|%d|%s|%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d", \
                     $2, pg[1], pg[2], \
                     $7, $9, $11, \
                     $13, $15, $17, $19, $21, \
-                    $23, $25, $27, $31, num($33), $35
+                    $23, $25, $27, $31, num($33), $35)
             } else if (op == "op_w" && NF == 40 && \
                        $22 == "peers" && $27 == "bluestore_lat" && \
                        $29 == "(prepare" && $39 == "op_lat") {
-                printf "op_w|%d|%s|%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d\n", \
+                candidate = sprintf("op_w|%d|%s|%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d", \
                     $2, pg[1], pg[2], \
                     $7, $9, $11, \
                     $13, $15, $17, $19, $21, \
                     num($23), num($24), num($25), num($26), \
-                    $28, $30, $32, $36, num($38), $40
+                    $28, $30, $32, $36, num($38), $40)
             }
             # else: row was truncated, has [delayed...] suffix, or printed
             #       an op type we do not parse.  Dropped silently.
+            if (candidate != "") {
+                flush_pending()
+                prev = candidate
+            }
         }
+        # END deliberately omitted: prev holds the last data row the
+        # parser would have emitted; not flushing it here drops it.
     ' "$1"
 }
 
@@ -117,11 +133,23 @@ _osdtrace_rows() {
 # guards against the same kind of partial-write artifact appearing in
 # the size/latency fields.
 _radostrace_rows() {
+    # Drop the last data row.  SIGKILL/SIGTERM of the writer can leave
+    # the file's tail mid-printf (e.g. an `rbd_data.<hex>.<seq>` object
+    # name truncated to just `rbd`), and the NF >= 10 predicate is
+    # loose enough to admit those byte-truncated rows.  Buffering the
+    # latest match in `prev` and not flushing it at END drops exactly
+    # the one potentially-malformed row; previously-completed write()
+    # syscalls already landed atomically, so every earlier match is
+    # safe.  Cost: one good row per trace among thousands.
     awk '
+        function flush_pending() { if (prev != "") { print prev; prev = "" } }
         $1 ~ /^[0-9]+$/ && NF >= 10 {
-            print $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" \
-                  ($8 + 0) "|" ($9 + 0) "|" $10
+            flush_pending()
+            prev = $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" \
+                   ($8 + 0) "|" ($9 + 0) "|" $10
         }
+        # END deliberately omitted: prev holds the last data row; not
+        # flushing it here drops it.
     ' "$1"
 }
 
