@@ -45,6 +45,7 @@ MIN_RGW_ROWS=50
 FSID=""
 
 cleanup() {
+    local rc=$?
     info "=== Cleanup ==="
     pkill -f "$PROJECT_ROOT/osdtrace" 2>/dev/null || true
     pkill -f "$PROJECT_ROOT/radostrace" 2>/dev/null || true
@@ -66,8 +67,15 @@ cleanup() {
             cleanup_cephadm_cluster "$FSID" || true
         fi
     fi
-    if [[ "${KEEP_CLUSTER:-0}" -ne 1 ]]; then
+    # Preserve trace logs on failure (rc != 0) so the GHA artifact-upload
+    # step in .github/workflows/pr-build.yaml has the full file to attach;
+    # cleanup_cephadm_cluster already wiped the runtime state, so the only
+    # remaining cost is a few MB of log on the runner's tmpfs.  Also keep
+    # them when KEEP_CLUSTER=1 (developer is iterating locally).
+    if [[ $rc -eq 0 && "${KEEP_CLUSTER:-0}" -ne 1 ]]; then
         rm -f "$S3CFG" "$OSDTRACE_LOG" "$RADOSTRACE_LOG" "$WORKLOAD_LOG" 2>/dev/null || true
+    else
+        info "Preserving trace logs at $OSDTRACE_LOG / $RADOSTRACE_LOG (exit=$rc)"
     fi
     info "cleanup done"
 }
