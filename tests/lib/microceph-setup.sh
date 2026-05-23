@@ -46,17 +46,46 @@ microceph_setup_single_node() {
         info "Already have $current_osds OSDs (target $osd_count)"
     fi
 
-    info "Waiting for cluster to be healthy (timeout ${health_timeout}s)..."
+    # Wait until the cluster is genuinely ready to accept traffic.  A fresh
+    # bootstrap reports HEALTH_WARN immediately (because of TOO_FEW_OSDS,
+    # mon_warn_on_insecure_global_id_reclaim, etc.), so grepping for
+    # HEALTH_(OK|WARN) alone returns "ready" with 0 OSDs up -- and the test
+    # then attaches osdtrace to a ceph-osd PID that exits seconds later when
+    # the cluster's first pool-create races a still-booting OSD.
+    #
+    # Require: at least one mon in quorum, the requested number of OSDs
+    # both up AND in, and the overall health string OK or WARN.
+    info "Waiting for $osd_count OSDs up+in and mon quorum (timeout ${health_timeout}s)..."
     local elapsed=0
     while [ "$elapsed" -lt "$health_timeout" ]; do
-        if microceph.ceph status 2>/dev/null | grep -q "HEALTH_OK\|HEALTH_WARN"; then
-            info "Cluster is ready (${elapsed}s)"
+        local status_json
+        status_json=$(microceph.ceph status --format=json 2>/dev/null) || true
+        if [ -n "$status_json" ] && python3 -c "
+import json, sys
+try:
+    d = json.loads('''$status_json''')
+except Exception:
+    sys.exit(2)
+health = d.get('health', {}).get('status', '')
+quorum = len(d.get('quorum_names', []))
+osdmap = d.get('osdmap', {})
+ups = osdmap.get('num_up_osds', 0)
+ins = osdmap.get('num_in_osds', 0)
+need = int('$osd_count')
+sys.exit(0 if (health in ('HEALTH_OK', 'HEALTH_WARN')
+               and quorum >= 1
+               and ups >= need
+               and ins >= need)
+         else 1)
+"; then
+            info "Cluster ready: ${osd_count} OSDs up+in (${elapsed}s)"
             return 0
         fi
         sleep 5
         elapsed=$((elapsed + 5))
     done
-    err "Cluster did not become healthy within ${health_timeout}s"
+    err "Cluster did not become ready (${osd_count} OSDs up+in) within ${health_timeout}s"
+    microceph.ceph status 2>&1 | tail -20 || true
     return 1
 }
 
