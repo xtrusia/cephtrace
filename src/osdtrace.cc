@@ -1334,8 +1334,12 @@ int main(int argc, char **argv) {
 
   std::cout << "Tracing ceph-osd at: " << osd_path << std::endl;
 
-  // Check if any ceph-osd processes are running with old/deleted executables
-  if (check_executable_deleted(-1, "ceph-osd")) {
+  // Check if any ceph-osd processes are running with old/deleted executables.
+  // Only enforced for live tracing; for JSON export we deliberately want to
+  // read the *on-disk* (possibly newly-upgraded) binary so the exported
+  // DWARF metadata matches the binary version recorded in the JSON, not
+  // whatever stale image happens to still be mapped in the process.
+  if (!export_json && check_executable_deleted(-1, "ceph-osd")) {
     std::cerr << "Warning: Found ceph-osd processes running with deleted/old executables." << std::endl;
     std::cerr << "This may indicate that ceph-osd was updated but processes haven't been restarted." << std::endl;
     std::cerr << "Consider restarting ceph-osd services for accurate tracing." << std::endl;

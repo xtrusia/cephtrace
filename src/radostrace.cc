@@ -520,7 +520,10 @@ int main(int argc, char **argv) {
     clog << "Libraries to be traced: " << librbd_path << ", " << librados_path << ", " << libceph_common_path << endl;
   }
 
-  if (check_library_deleted(process_id, "librados")) {
+  // Same rationale as osdtrace: skip the deleted-library check when we are
+  // exporting JSON, since the export path intentionally wants to parse the
+  // newly-upgraded on-disk binaries.
+  if (!export_json && check_library_deleted(process_id, "librados")) {
      cerr << "Error: librados library mismatch detected!" << endl;
      cerr << "The ceph package has been upgraded on disk, but one or more processes are still using the old version in memory." << endl;
      cerr << "Please restart the affected processes to pick up the new version." << endl;
