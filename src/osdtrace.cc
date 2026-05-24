@@ -1357,6 +1357,9 @@ int main(int argc, char **argv) {
   if (parse_args(argc, argv) < 0) return 0;
 
   if (detect_only) {
+    if (geteuid() != 0) {
+      std::cout << "Warning: Running without root privileges. Containerized status of OSDs owned by other users may not be accurately detected." << std::endl << std::endl;
+    }
     auto processes = discover_ceph_osd_processes();
     if (processes.empty()) {
       std::cout << "No active ceph-osd processes detected on the host." << std::endl;
