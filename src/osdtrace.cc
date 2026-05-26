@@ -1101,6 +1101,16 @@ std::vector<OsdProcessInfo> discover_ceph_osd_processes() {
   return results;
 }
 
+void print_discovered_osds(const std::vector<OsdProcessInfo>& processes) {
+  printf("  %-10s %-10s %-12s %-50s\n", "PID", "OSD ID", "Container", "Executable Path");
+  printf("  --------------------------------------------------------------------------------\n");
+  for (const auto& proc : processes) {
+    std::string osd_id_str = (proc.osd_id == -1) ? "unknown" : std::to_string(proc.osd_id);
+    std::string container_str = proc.is_container ? "yes" : "no";
+    printf("  %-10d %-10s %-12s %-50s\n", proc.pid, osd_id_str.c_str(), container_str.c_str(), proc.exe_path.c_str());
+  }
+}
+
 std::set<int> process_ids;  // Support multiple PIDs (set ensures deduplication)
 int parse_args(int argc, char **argv) {
   static struct option long_options[] = {
@@ -1365,13 +1375,7 @@ int main(int argc, char **argv) {
       std::cout << "No active ceph-osd processes detected on the host." << std::endl;
     } else {
       std::cout << "Detected " << processes.size() << " active ceph-osd process(es) on the host:" << std::endl;
-      printf("  %-10s %-10s %-12s %-50s\n", "PID", "OSD ID", "Container", "Executable Path");
-      printf("  --------------------------------------------------------------------------------\n");
-      for (const auto& proc : processes) {
-        std::string osd_id_str = (proc.osd_id == -1) ? "unknown" : std::to_string(proc.osd_id);
-        std::string container_str = proc.is_container ? "yes" : "no";
-        printf("  %-10d %-10s %-12s %-50s\n", proc.pid, osd_id_str.c_str(), container_str.c_str(), proc.exe_path.c_str());
-      }
+      print_discovered_osds(processes);
     }
     return 0;
   }
@@ -1440,14 +1444,11 @@ int main(int argc, char **argv) {
       std::cout << "Warning: No active ceph-osd processes detected on the host." << std::endl;
       std::cout << "osdtrace will start tracing globally, but no events will be captured until a ceph-osd process runs." << std::endl;
     } else {
-      std::cout << "Detected active ceph-osd process(es) on the host:" << std::endl;
-      printf("  %-10s %-10s %-12s %-50s\n", "PID", "OSD ID", "Container", "Executable Path");
-      printf("  --------------------------------------------------------------------------------\n");
-      for (const auto& proc : processes) {
-        std::string osd_id_str = (proc.osd_id == -1) ? "unknown" : std::to_string(proc.osd_id);
-        std::string container_str = proc.is_container ? "yes" : "no";
-        printf("  %-10d %-10s %-12s %-50s\n", proc.pid, osd_id_str.c_str(), container_str.c_str(), proc.exe_path.c_str());
+      if (geteuid() != 0) {
+        std::cout << "Warning: Running without root privileges. Containerized status of OSDs owned by other users may not be accurately detected." << std::endl << std::endl;
       }
+      std::cout << "Detected active ceph-osd process(es) on the host:" << std::endl;
+      print_discovered_osds(processes);
       std::cout << std::endl;
     }
   }
