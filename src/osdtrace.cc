@@ -1022,11 +1022,101 @@ std::string json_output_file;
 bool import_json = false;
 bool export_json = false;
 bool skip_version_check = false;
+bool list_only = false;
+
+struct OsdProcessInfo {
+  int pid;
+  int osd_id;
+  std::string exe_path;
+  bool is_container;
+};
+
+std::string get_mnt_ns(int pid) {
+  char link_target[256];
+  std::string ns_path = "/proc/" + std::to_string(pid) + "/ns/mnt";
+  ssize_t len = readlink(ns_path.c_str(), link_target, sizeof(link_target) - 1);
+  if (len != -1) {
+    link_target[len] = '\0';
+    return std::string(link_target);
+  }
+  return "";
+}
+
+std::vector<OsdProcessInfo> discover_ceph_osd_processes() {
+  std::vector<OsdProcessInfo> results;
+  DIR* proc_dir = opendir("/proc");
+  if (!proc_dir) {
+    std::cerr << "Error: Could not open /proc directory" << std::endl;
+    return results;
+  }
+
+  std::string self_ns = get_mnt_ns(getpid());
+
+  struct dirent* entry;
+  while ((entry = readdir(proc_dir)) != NULL) {
+    if (entry->d_type == DT_DIR && isdigit(entry->d_name[0])) {
+      int pid = 0;
+      try {
+        pid = std::stoi(entry->d_name);
+      } catch (...) {
+        continue;
+      }
+
+      std::string exe_path = get_exe_path_for_pid(pid);
+      if (exe_path.empty()) {
+        // Fallback: read first argument from /proc/<pid>/cmdline
+        std::string cmdline_path = "/proc/" + std::to_string(pid) + "/cmdline";
+        std::ifstream cmd_file(cmdline_path, std::ios::binary);
+        if (cmd_file) {
+          std::getline(cmd_file, exe_path, '\0');
+        }
+      }
+
+      if (!exe_path.empty()) {
+        std::string basename = get_basename(exe_path);
+        if (basename == "ceph-osd") {
+          int osd_id = osd_pid_to_id(pid);
+          
+          bool is_container = false;
+          std::string proc_ns = get_mnt_ns(pid);
+          if (!self_ns.empty() && !proc_ns.empty() && self_ns != proc_ns) {
+            is_container = true;
+          }
+          
+          results.push_back({pid, osd_id, exe_path, is_container});
+        }
+      }
+    }
+  }
+  closedir(proc_dir);
+
+  // Sort primarily by OSD ID, then by PID
+  std::sort(results.begin(), results.end(), [](const OsdProcessInfo& a, const OsdProcessInfo& b) {
+    if (a.osd_id != b.osd_id) {
+      return a.osd_id < b.osd_id;
+    }
+    return a.pid < b.pid;
+  });
+
+  return results;
+}
+
+void print_discovered_osds(const std::vector<OsdProcessInfo>& processes) {
+  printf("  %-10s %-10s %-12s %-50s\n", "PID", "OSD ID", "Container", "Executable Path");
+  printf("  --------------------------------------------------------------------------------\n");
+  for (const auto& proc : processes) {
+    std::string osd_id_str = (proc.osd_id == -1) ? "unknown" : std::to_string(proc.osd_id);
+    std::string container_str = proc.is_container ? "yes" : "no";
+    printf("  %-10d %-10s %-12s %-50s\n", proc.pid, osd_id_str.c_str(), container_str.c_str(), proc.exe_path.c_str());
+  }
+}
+
 std::set<int> process_ids;  // Support multiple PIDs (set ensures deduplication)
 int parse_args(int argc, char **argv) {
   static struct option long_options[] = {
     {"skip-version-check", no_argument, 0, 0},
     {"version", no_argument, 0, 'V'},
+    {"list", no_argument, 0, 0},
     {0, 0, 0, 0}
   };
 
@@ -1041,6 +1131,8 @@ int parse_args(int argc, char **argv) {
         // Handle long options
         if (strcmp(long_options[option_index].name, "skip-version-check") == 0) {
           skip_version_check = true;
+        } else if (strcmp(long_options[option_index].name, "list") == 0) {
+          list_only = true;
         }
         break;
       case 'V':
@@ -1106,7 +1198,7 @@ int parse_args(int argc, char **argv) {
         break;
       case '?':
       case 'h':
-        std::cout << "Usage: " << argv[0] << "[-d <seconds>] [-m <avg|max>] [-l <milliseconds>] [-o <osd-id>] [-x] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--skip-version-check]\n";
+        std::cout << "Usage: " << argv[0] << " [-d <seconds>] [-m <avg|max>] [-l <milliseconds>] [-o <osd-id>] [-x] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--skip-version-check] [--list]\n";
         std::cout << "  -d <seconds>              Set probe duration in seconds to calculate average latency\n";
         std::cout << "  -m <avg|max>              Set operation latency collection mode\n";
         std::cout << "  -l <milliseconds>         Set operation latency threshold to capture\n";
@@ -1118,6 +1210,7 @@ int parse_args(int argc, char **argv) {
         std::cout << "  -t <seconds>              Set execution timeout in seconds\n";
         std::cout << "  -p <pid1,pid2,...>        Probe using Process IDs (comma-separated, mandatory for tracing containerized processes)\n";
         std::cout << "  --skip-version-check      Skip version check when importing DWARF JSON (currently needed for containers)\n";
+        std::cout << "  --list                    List active ceph-osd processes on the host, their PIDs and OSD IDs, and exit\n";
         std::cout << "  -V, --version             Print version information and exit\n";
         std::cout << "  -h                        Show this help message\n";
         std::cout << "----------------------------------------------------------------------------------------------------------------------------------------\n";
@@ -1273,6 +1366,20 @@ int main(int argc, char **argv) {
 
   if (parse_args(argc, argv) < 0) return 0;
 
+  if (list_only) {
+    if (geteuid() != 0) {
+      std::cout << "Warning: Running without root privileges. Containerized status of OSDs owned by other users may not be accurately detected." << std::endl << std::endl;
+    }
+    auto processes = discover_ceph_osd_processes();
+    if (processes.empty()) {
+      std::cout << "No active ceph-osd processes detected on the host." << std::endl;
+    } else {
+      std::cout << "Detected " << processes.size() << " active ceph-osd process(es) on the host:" << std::endl;
+      print_discovered_osds(processes);
+    }
+    return 0;
+  }
+
   // Validate all process_ids if specified
   for (int pid : process_ids) {
     std::string proc_path = "/proc/" + std::to_string(pid);
@@ -1329,6 +1436,20 @@ int main(int argc, char **argv) {
     if (osd_path.empty()) {
       std::cerr << "Error: Could not find ceph-osd executable" << std::endl;
       return 1;
+    }
+
+    // Auto-detect and print active OSD processes to inform the user
+    auto processes = discover_ceph_osd_processes();
+    if (processes.empty()) {
+      std::cout << "Warning: No active ceph-osd processes detected on the host." << std::endl;
+      std::cout << "osdtrace will start tracing globally, but no events will be captured until a ceph-osd process runs." << std::endl;
+    } else {
+      if (geteuid() != 0) {
+        std::cout << "Warning: Running without root privileges. Containerized status of OSDs owned by other users may not be accurately detected." << std::endl << std::endl;
+      }
+      std::cout << "Detected active ceph-osd process(es) on the host:" << std::endl;
+      print_discovered_osds(processes);
+      std::cout << std::endl;
     }
   }
 
