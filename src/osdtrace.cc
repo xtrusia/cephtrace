@@ -1022,7 +1022,7 @@ std::string json_output_file;
 bool import_json = false;
 bool export_json = false;
 bool skip_version_check = false;
-bool detect_only = false;
+bool list_only = false;
 
 struct OsdProcessInfo {
   int pid;
@@ -1106,7 +1106,7 @@ int parse_args(int argc, char **argv) {
   static struct option long_options[] = {
     {"skip-version-check", no_argument, 0, 0},
     {"version", no_argument, 0, 'V'},
-    {"detect", no_argument, 0, 0},
+    {"list", no_argument, 0, 0},
     {0, 0, 0, 0}
   };
 
@@ -1121,8 +1121,8 @@ int parse_args(int argc, char **argv) {
         // Handle long options
         if (strcmp(long_options[option_index].name, "skip-version-check") == 0) {
           skip_version_check = true;
-        } else if (strcmp(long_options[option_index].name, "detect") == 0) {
-          detect_only = true;
+        } else if (strcmp(long_options[option_index].name, "list") == 0) {
+          list_only = true;
         }
         break;
       case 'V':
@@ -1188,7 +1188,7 @@ int parse_args(int argc, char **argv) {
         break;
       case '?':
       case 'h':
-        std::cout << "Usage: " << argv[0] << " [-d <seconds>] [-m <avg|max>] [-l <milliseconds>] [-o <osd-id>] [-x] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--skip-version-check] [--detect]\n";
+        std::cout << "Usage: " << argv[0] << " [-d <seconds>] [-m <avg|max>] [-l <milliseconds>] [-o <osd-id>] [-x] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--skip-version-check] [--list]\n";
         std::cout << "  -d <seconds>              Set probe duration in seconds to calculate average latency\n";
         std::cout << "  -m <avg|max>              Set operation latency collection mode\n";
         std::cout << "  -l <milliseconds>         Set operation latency threshold to capture\n";
@@ -1200,7 +1200,7 @@ int parse_args(int argc, char **argv) {
         std::cout << "  -t <seconds>              Set execution timeout in seconds\n";
         std::cout << "  -p <pid1,pid2,...>        Probe using Process IDs (comma-separated, mandatory for tracing containerized processes)\n";
         std::cout << "  --skip-version-check      Skip version check when importing DWARF JSON (currently needed for containers)\n";
-        std::cout << "  --detect                  Detect active ceph-osd processes on the host, list their PIDs and OSD IDs, and exit\n";
+        std::cout << "  --list                    List active ceph-osd processes on the host, their PIDs and OSD IDs, and exit\n";
         std::cout << "  -V, --version             Print version information and exit\n";
         std::cout << "  -h                        Show this help message\n";
         std::cout << "----------------------------------------------------------------------------------------------------------------------------------------\n";
@@ -1356,7 +1356,7 @@ int main(int argc, char **argv) {
 
   if (parse_args(argc, argv) < 0) return 0;
 
-  if (detect_only) {
+  if (list_only) {
     if (geteuid() != 0) {
       std::cout << "Warning: Running without root privileges. Containerized status of OSDs owned by other users may not be accurately detected." << std::endl << std::endl;
     }
