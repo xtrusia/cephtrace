@@ -213,7 +213,6 @@ static __u64 bootstamp = 0;
 
 __u64 threshold = 0; //in millisecond
 int timeout = -1; //in seconds
-int probe_osdid = -1;
 
 volatile sig_atomic_t timeout_occurred = 0;
 
@@ -983,24 +982,20 @@ static int handle_event(void *ctx, void *data, size_t size) {
     pid = val->pid;
     osd_id = osd_pid_to_id(pid);
 
-    if (probe_osdid == -1 || probe_osdid == osd_id) {
-      if (probe_mode == OP_SINGLE_PROBE) {
-        handle_single(val, osd_id);
-      } else if (probe_mode & OP_FULL_PROBE) {
-        if (mode == MODE_AVG) {
-          clog << "avg mode needs to be refined" << endl;
-          //handle_avg(val, osd_id);
-        } else if (mode == MODE_ALL){
-          handle_full(val, osd_id);
-        }
+    if (probe_mode == OP_SINGLE_PROBE) {
+      handle_single(val, osd_id);
+    } else if (probe_mode & OP_FULL_PROBE) {
+      if (mode == MODE_AVG || mode == MODE_MAX) {
+        handle_avg(val, osd_id);
+      } else if (mode == MODE_ALL){
+        handle_full(val, osd_id);
       }
     }
   } else if (is_bluestore_event && (probe_mode & BLUESTORE_PROBE)) {
     struct bluestore_lat_v *val = (struct bluestore_lat_v *) data;
     pid = val->pid;
     osd_id = osd_pid_to_id(pid);
-    if (probe_osdid == -1 || probe_osdid == osd_id)
-      handle_bluestore(val, osd_id);
+    handle_bluestore(val, osd_id);
   }
 
   if (!exists(osd_id)) {
@@ -1112,11 +1107,13 @@ void print_discovered_osds(const std::vector<OsdProcessInfo>& processes) {
 }
 
 std::set<int> process_ids;  // Support multiple PIDs (set ensures deduplication)
+std::set<int> target_osd_ids; // Support multiple OSD IDs
 int parse_args(int argc, char **argv) {
   static struct option long_options[] = {
     {"skip-version-check", no_argument, 0, 0},
     {"version", no_argument, 0, 'V'},
     {"list", no_argument, 0, 0},
+    {"id", required_argument, 0, 0},
     {0, 0, 0, 0}
   };
 
@@ -1125,7 +1122,7 @@ int parse_args(int argc, char **argv) {
   // it in a plain char is unsafe on platforms where char is unsigned by
   // default (the `!= -1` test can then loop forever).  Match kfstrace.
   int opt;
-  while ((opt = getopt_long(argc, argv, ":d:m:t:o:xbj:i:l:p:V", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, ":d:m:t:xbj:i:l:p:V", long_options, &option_index)) != -1) {
     switch (opt) {
       case 0:
         // Handle long options
@@ -1133,6 +1130,19 @@ int parse_args(int argc, char **argv) {
           skip_version_check = true;
         } else if (strcmp(long_options[option_index].name, "list") == 0) {
           list_only = true;
+        } else if (strcmp(long_options[option_index].name, "id") == 0) {
+          std::string id_str(optarg);
+          std::stringstream ss(id_str);
+          std::string token;
+          while (std::getline(ss, token, ',')) {
+            try {
+              int osd_id = stoi(token);
+              target_osd_ids.insert(osd_id);
+            } catch (...) {
+              std::cerr << "Invalid OSD ID value: " << token << std::endl;
+              return -1;
+            }
+          }
         }
         break;
       case 'V':
@@ -1159,9 +1169,6 @@ int parse_args(int argc, char **argv) {
         break;
       case 'b':
         probe_mode |= BLUESTORE_PROBE;
-        break;
-      case 'o':
-        probe_osdid = stoi(optarg);
         break;
       case 'j':
         export_json = true;
@@ -1198,31 +1205,21 @@ int parse_args(int argc, char **argv) {
         break;
       case '?':
       case 'h':
-        std::cout << "Usage: " << argv[0] << " [-d <seconds>] [-m <avg|max>] [-l <milliseconds>] [-o <osd-id>] [-x] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--skip-version-check] [--list]\n";
+        std::cout << "Usage: " << argv[0] << " [-d <seconds>] [-m <avg|max>] [-l <milliseconds>] [-x] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--skip-version-check] [--list] [--id <osd-id1,osd-id2,...>]\n";
         std::cout << "  -d <seconds>              Set probe duration in seconds to calculate average latency\n";
         std::cout << "  -m <avg|max>              Set operation latency collection mode\n";
         std::cout << "  -l <milliseconds>         Set operation latency threshold to capture\n";
-        std::cout << "  -o <osd-id>               Only probe a specific OSD\n";
-        std::cout << "  -x                        Set probe mode to Full OPs. See below for details\n";
-        std::cout << "  -b                        Set probe mode to Bluestore. See below for details\n";
+        std::cout << "  -x                        Set probe mode to Full OPs\n";
+        std::cout << "  -b                        Set probe mode to Bluestore\n";
         std::cout << "  -j                        Export DWARF info to JSON file\n";
         std::cout << "  -i <filename>             Import DWARF info from JSON file\n";
         std::cout << "  -t <seconds>              Set execution timeout in seconds\n";
         std::cout << "  -p <pid1,pid2,...>        Probe using Process IDs (comma-separated, mandatory for tracing containerized processes)\n";
         std::cout << "  --skip-version-check      Skip version check when importing DWARF JSON (currently needed for containers)\n";
         std::cout << "  --list                    List active ceph-osd processes on the host, their PIDs and OSD IDs, and exit\n";
+        std::cout << "  --id <osd-id1,...>        Trace specific OSD ID(s) by automatically discovering and attaching uprobes to their PIDs\n";
         std::cout << "  -V, --version             Print version information and exit\n";
         std::cout << "  -h                        Show this help message\n";
-        std::cout << "----------------------------------------------------------------------------------------------------------------------------------------\n";
-        std::cout << "                                                SUPPORTED PROBE MODE DETAILS\n";
-        std::cout << "----------------------------------------------------------------------------------------------------------------------------------------\n";
-        std::cout << "  Default:\n    PrimaryLogPG::log_op_stats\n";
-        std::cout << "  \n  Full Ops (-x):\n    OSD::dequeue_op\n";
-        std::cout << "    PrimaryLogPG::execute_ctx\n    ECBackend::submit_transaction\n    OpRequest::mark_flag_point_string\n";
-        std::cout << "    PrimaryLogPG::log_op_stats\n    ReplicatedBackend::generate_subop\n    ReplicatedBackend::do_repop_reply\n";
-        std::cout << "    BlueStore::queue_transactions\n    BlueStore::_txc_calc_cost\n    BlueStore::_txc_state_proc\n";
-        std::cout << "    ReplicatedBackend::repop_commit\n    OSD::enqueue_op\n";
-        std::cout << "  \n  Bluestore (-b):\n    BlueStore::log_latency\n";
         exit(0);
       case ':':
         clog << "Missing arg for " << optopt << endl;
@@ -1378,6 +1375,37 @@ int main(int argc, char **argv) {
       print_discovered_osds(processes);
     }
     return 0;
+  }
+
+  if (!target_osd_ids.empty()) {
+    // Resolve target OSD IDs to process PIDs using the process discovery helper
+    if (geteuid() != 0) {
+      std::cout << "Warning: Running without root privileges. Containerized status/OSD IDs of OSDs owned by other users may not be accurately detected." << std::endl << std::endl;
+    }
+    auto processes = discover_ceph_osd_processes();
+    std::set<int> resolved_pids;
+    for (int target_id : target_osd_ids) {
+      bool found = false;
+      for (const auto& proc : processes) {
+        if (proc.osd_id == target_id) {
+          process_ids.insert(proc.pid);
+          resolved_pids.insert(proc.pid);
+          found = true;
+        }
+      }
+      if (!found) {
+        std::cerr << "Error: No active ceph-osd process found for OSD ID " << target_id << std::endl;
+        return 1;
+      }
+    }
+    if (!resolved_pids.empty()) {
+      std::cout << "Resolved OSD ID(s) to PID(s): ";
+      for (auto it = resolved_pids.begin(); it != resolved_pids.end(); ++it) {
+        if (it != resolved_pids.begin()) std::cout << ", ";
+        std::cout << *it;
+      }
+      std::cout << std::endl << std::endl;
+    }
   }
 
   // Validate all process_ids if specified
