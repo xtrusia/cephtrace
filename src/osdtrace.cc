@@ -213,7 +213,6 @@ static __u64 bootstamp = 0;
 
 __u64 threshold = 0; //in millisecond
 int timeout = -1; //in seconds
-int probe_osdid = -1;
 
 volatile sig_atomic_t timeout_occurred = 0;
 
@@ -983,24 +982,21 @@ static int handle_event(void *ctx, void *data, size_t size) {
     pid = val->pid;
     osd_id = osd_pid_to_id(pid);
 
-    if (probe_osdid == -1 || probe_osdid == osd_id) {
-      if (probe_mode == OP_SINGLE_PROBE) {
-        handle_single(val, osd_id);
-      } else if (probe_mode & OP_FULL_PROBE) {
-        if (mode == MODE_AVG) {
-          clog << "avg mode needs to be refined" << endl;
-          //handle_avg(val, osd_id);
-        } else if (mode == MODE_ALL){
-          handle_full(val, osd_id);
-        }
+    if (probe_mode == OP_SINGLE_PROBE) {
+      handle_single(val, osd_id);
+    } else if (probe_mode & OP_FULL_PROBE) {
+      if (mode == MODE_AVG) {
+        clog << "avg mode needs to be refined" << endl;
+        //handle_avg(val, osd_id);
+      } else if (mode == MODE_ALL){
+        handle_full(val, osd_id);
       }
     }
   } else if (is_bluestore_event && (probe_mode & BLUESTORE_PROBE)) {
     struct bluestore_lat_v *val = (struct bluestore_lat_v *) data;
     pid = val->pid;
     osd_id = osd_pid_to_id(pid);
-    if (probe_osdid == -1 || probe_osdid == osd_id)
-      handle_bluestore(val, osd_id);
+    handle_bluestore(val, osd_id);
   }
 
   if (!exists(osd_id)) {
@@ -1112,11 +1108,13 @@ void print_discovered_osds(const std::vector<OsdProcessInfo>& processes) {
 }
 
 std::set<int> process_ids;  // Support multiple PIDs (set ensures deduplication)
+std::set<int> requested_osd_ids;  // Populated by --id; resolved to PIDs in main()
 int parse_args(int argc, char **argv) {
   static struct option long_options[] = {
     {"skip-version-check", no_argument, 0, 0},
     {"version", no_argument, 0, 'V'},
     {"list", no_argument, 0, 0},
+    {"id", required_argument, 0, 0},
     {0, 0, 0, 0}
   };
 
@@ -1125,7 +1123,7 @@ int parse_args(int argc, char **argv) {
   // it in a plain char is unsafe on platforms where char is unsigned by
   // default (the `!= -1` test can then loop forever).  Match kfstrace.
   int opt;
-  while ((opt = getopt_long(argc, argv, ":d:m:t:o:xbj:i:l:p:V", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, ":d:m:t:xbj:i:l:p:V", long_options, &option_index)) != -1) {
     switch (opt) {
       case 0:
         // Handle long options
@@ -1133,6 +1131,22 @@ int parse_args(int argc, char **argv) {
           skip_version_check = true;
         } else if (strcmp(long_options[option_index].name, "list") == 0) {
           list_only = true;
+        } else if (strcmp(long_options[option_index].name, "id") == 0) {
+          std::stringstream ss(optarg);
+          std::string token;
+          while (std::getline(ss, token, ',')) {
+            try {
+              int id = stoi(token);
+              if (id < 0) {
+                std::cerr << "Invalid --id value (must be non-negative): " << token << std::endl;
+                return -1;
+              }
+              requested_osd_ids.insert(id);
+            } catch (...) {
+              std::cerr << "Invalid --id value: " << token << std::endl;
+              return -1;
+            }
+          }
         }
         break;
       case 'V':
@@ -1159,9 +1173,6 @@ int parse_args(int argc, char **argv) {
         break;
       case 'b':
         probe_mode |= BLUESTORE_PROBE;
-        break;
-      case 'o':
-        probe_osdid = stoi(optarg);
         break;
       case 'j':
         export_json = true;
@@ -1198,17 +1209,17 @@ int parse_args(int argc, char **argv) {
         break;
       case '?':
       case 'h':
-        std::cout << "Usage: " << argv[0] << " [-d <seconds>] [-m <avg|max>] [-l <milliseconds>] [-o <osd-id>] [-x] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--skip-version-check] [--list]\n";
+        std::cout << "Usage: " << argv[0] << " [-d <seconds>] [-m <avg|max>] [-l <milliseconds>] [-x] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--id <osd-id1,osd-id2,...>] [--skip-version-check] [--list]\n";
         std::cout << "  -d <seconds>              Set probe duration in seconds to calculate average latency\n";
         std::cout << "  -m <avg|max>              Set operation latency collection mode\n";
         std::cout << "  -l <milliseconds>         Set operation latency threshold to capture\n";
-        std::cout << "  -o <osd-id>               Only probe a specific OSD\n";
         std::cout << "  -x                        Set probe mode to Full OPs. See below for details\n";
         std::cout << "  -b                        Set probe mode to Bluestore. See below for details\n";
         std::cout << "  -j                        Export DWARF info to JSON file\n";
         std::cout << "  -i <filename>             Import DWARF info from JSON file\n";
         std::cout << "  -t <seconds>              Set execution timeout in seconds\n";
         std::cout << "  -p <pid1,pid2,...>        Probe using Process IDs (comma-separated, mandatory for tracing containerized processes)\n";
+        std::cout << "  --id <osd-id1,osd-id2,...> Probe by OSD ID (comma-separated; resolves to PIDs via discovery)\n";
         std::cout << "  --skip-version-check      Skip version check when importing DWARF JSON (currently needed for containers)\n";
         std::cout << "  --list                    List active ceph-osd processes on the host, their PIDs and OSD IDs, and exit\n";
         std::cout << "  -V, --version             Print version information and exit\n";
@@ -1378,6 +1389,35 @@ int main(int argc, char **argv) {
       print_discovered_osds(processes);
     }
     return 0;
+  }
+
+  // Resolve --id <osd-id,...> to PIDs via discovery and feed into process_ids.
+  if (!requested_osd_ids.empty()) {
+    if (!process_ids.empty()) {
+      std::cerr << "Error: --id and -p are mutually exclusive" << std::endl;
+      return 1;
+    }
+    auto processes = discover_ceph_osd_processes();
+    for (int want : requested_osd_ids) {
+      std::vector<int> matches;
+      for (const auto& p : processes) {
+        if (p.osd_id == want) matches.push_back(p.pid);
+      }
+      if (matches.empty()) {
+        std::cerr << "Error: no running ceph-osd process found with OSD ID "
+                  << want << " (try --list)" << std::endl;
+        return 1;
+      }
+      if (matches.size() > 1) {
+        std::cerr << "Error: OSD ID " << want << " matched multiple PIDs (";
+        for (size_t i = 0; i < matches.size(); ++i)
+          std::cerr << (i ? "," : "") << matches[i];
+        std::cerr << "); use -p <pid> explicitly" << std::endl;
+        return 1;
+      }
+      process_ids.insert(matches[0]);
+      clog << "--id " << want << " resolved to PID " << matches[0] << endl;
+    }
   }
 
   // Validate all process_ids if specified

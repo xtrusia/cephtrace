@@ -468,6 +468,48 @@ _verify_radostrace_output_impl() {
 }
 
 
+# verify_osdtrace_targets_only <log> <target_osd_id> [target_osd_id ...]
+#
+# Anchors --id semantics: assert the set of distinct osd_id values appearing
+# in <log>'s data rows is a subset of the given targets.  Reuses
+# _osdtrace_rows so it shares the same NF/landmark-based row parser as the
+# main verifier (truncated tail rows are filtered upstream).
+#
+# Fails if:
+#   - any data row carries an osd_id outside the target set (proves uprobes
+#     attached to a process the user didn't ask for), or
+#   - no data rows were captured at all (proves the --id resolution → attach
+#     path produced *something*; the looser min_rows check is left to
+#     verify_osdtrace_output).
+verify_osdtrace_targets_only() {
+    local log=$1
+    shift
+    local -A want=()
+    local id
+    for id in "$@"; do
+        want[$id]=1
+    done
+
+    local total=0
+    local op_type osd_id _rest
+    while IFS='|' read -r op_type osd_id _rest; do
+        [ -z "$op_type" ] && continue
+        total=$((total + 1))
+        if [ -z "${want[$osd_id]:-}" ]; then
+            err "osdtrace row carries osd_id=$osd_id, expected one of: $* (log=$log)"
+            return 1
+        fi
+    done < <(_osdtrace_rows "$log")
+
+    if (( total == 0 )); then
+        err "osdtrace log $log has zero data rows; --id resolution may have failed silently"
+        return 1
+    fi
+
+    info "✓ osdtrace targets-only check passed ($total rows, all in {$*})"
+}
+
+
 # verify_osdtrace_rgw_output <log> <data_pool_id> <max_osd_id> <data_pool_pg_num> <min_rows>
 #
 # Variant of verify_osdtrace_output for RGW-driven workloads (S3 PUT/GET via
