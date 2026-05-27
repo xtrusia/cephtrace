@@ -106,7 +106,7 @@ microceph.rbd create --image-feature layering --size 1G test_pool/testimage
 info "=== Step 4: Start osdtrace in background (embedded mode, no --import-json) ==="
 # Trace runtime is 30 s — outlasts the bench (20 s) with enough margin to
 # stay attached for its entire lifetime even though osdtrace starts first.
-timeout 30 $PROJECT_ROOT/osdtrace -p $OSD_PID -x >$OSDTRACE_LOG 2>&1 &
+timeout 30 $PROJECT_ROOT/osdtrace -p $OSD_PID >$OSDTRACE_LOG 2>&1 &
 sleep 2 # ensure osdtrace starts before we get its PID
 OSDTRACE_PID=$(pidof osdtrace)
 info "Started osdtrace with PID $OSDTRACE_PID"

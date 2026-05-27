@@ -244,9 +244,8 @@ info "RGW PID=$RGW_PID, OSD PID=$OSD_PID"
 
 ############################################################################
 info "=== Step 11: start traces (osdtrace + radostrace in parallel) ==="
-# -x: per-event row format (one line per OSD op).  Without it osdtrace
-# emits aggregated stats which the verifier wouldn't recognise.
-timeout "$TRACE_SECONDS" "$PROJECT_ROOT/osdtrace"   -p "$OSD_PID" -x >"$OSDTRACE_LOG"   2>&1 &
+# osdtrace prints full per-event row format by default.
+timeout "$TRACE_SECONDS" "$PROJECT_ROOT/osdtrace"   -p "$OSD_PID" >"$OSDTRACE_LOG"   2>&1 &
 timeout "$TRACE_SECONDS" "$PROJECT_ROOT/radostrace" -p "$RGW_PID"    >"$RADOSTRACE_LOG" 2>&1 &
 
 # Give each tool a few seconds to parse DWARF and attach uprobes before
