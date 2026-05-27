@@ -69,7 +69,7 @@ if [ ! -f "$PROJECT_ROOT/radostrace" ]; then
 fi
 
 info "=== Step 1: Setup MicroCeph (install + bootstrap + OSDs + wait healthy) ==="
-if ! microceph_setup_single_node 3 1G 120; then
+if ! microceph_setup_single_node 3 3G 120; then
     err "MicroCeph cluster did not become healthy within timeout"
     exit 1
 fi
