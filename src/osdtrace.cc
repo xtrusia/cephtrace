@@ -975,7 +975,7 @@ int parse_args(int argc, char **argv) {
   // it in a plain char is unsafe on platforms where char is unsigned by
   // default (the `!= -1` test can then loop forever).  Match kfstrace.
   int opt;
-  while ((opt = getopt_long(argc, argv, ":t:bj:i:l:p:V", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, ":st:bj:i:l:p:V", long_options, &option_index)) != -1) {
     switch (opt) {
       case 0:
         // Handle long options
@@ -1005,6 +1005,10 @@ int parse_args(int argc, char **argv) {
         print_tool_version("osdtrace");
         exit(0);
 
+      case 's':
+        probe_mode &= ~OP_FULL_PROBE;
+        probe_mode |= OP_SINGLE_PROBE;
+        break;
       case 'l':
         threshold = stoi(optarg);
         break;
@@ -1046,7 +1050,8 @@ int parse_args(int argc, char **argv) {
         break;
       case '?':
       case 'h':
-        std::cout << "Usage: " << argv[0] << " [-l <milliseconds>] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--id <osd-id1,osd-id2,...>] [--skip-version-check] [--list]\n";
+        std::cout << "Usage: " << argv[0] << " [-s] [-l <milliseconds>] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--id <osd-id1,osd-id2,...>] [--skip-version-check] [--list]\n";
+        std::cout << "  -s                        Set probe mode to Single OP (logs PrimaryLogPG::log_op_stats only)\n";
         std::cout << "  -l <milliseconds>         Set operation latency threshold to capture\n";
         std::cout << "  -b                        Set probe mode to Bluestore\n";
         std::cout << "  -j                        Export DWARF info to JSON file\n";
