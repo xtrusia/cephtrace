@@ -171,7 +171,7 @@ microceph.rbd create --image-feature layering --size 1G test_pool/testimage
 info "=== Step 6: Start osdtrace in background ==="
 # Trace runtime is 30 s — outlasts the bench (20 s) with enough margin to
 # stay attached for its entire lifetime even though osdtrace starts first.
-timeout 30 $PROJECT_ROOT/osdtrace -i $OSD_DWARF -p $OSD_PID --skip-version-check -x >$OSDTRACE_LOG 2>&1 &
+timeout 30 $PROJECT_ROOT/osdtrace -i $OSD_DWARF -p $OSD_PID --skip-version-check >$OSDTRACE_LOG 2>&1 &
 sleep 2 # ensure osdtrace starts before we get its PID
 OSDTRACE_PID=$(pidof osdtrace)
 info "Started osdtrace with PID $OSDTRACE_PID"
@@ -184,7 +184,7 @@ info "=== Step 6b: Start a second osdtrace targeting OSD $TARGET_OSD_ID via --id
 # $TARGET_OSD_ID to its PID, and attach to *only* that PID — which the
 # verifier then proves by checking that every captured row carries
 # osd_id=$TARGET_OSD_ID (using verify_osdtrace_targets_only).
-timeout 30 $PROJECT_ROOT/osdtrace -i $OSD_DWARF --id $TARGET_OSD_ID --skip-version-check -x >$OSDTRACE_ID_LOG 2>&1 &
+timeout 30 $PROJECT_ROOT/osdtrace -i $OSD_DWARF --id $TARGET_OSD_ID --skip-version-check >$OSDTRACE_ID_LOG 2>&1 &
 OSDTRACE_ID_BG_PID=$!
 sleep 3
 

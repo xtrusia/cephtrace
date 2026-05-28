@@ -207,7 +207,7 @@ enum probe_mode_e {
     BLUESTORE_PROBE = 4
 };
 
-int probe_mode = OP_SINGLE_PROBE;
+int probe_mode = OP_FULL_PROBE;
 
 static __u64 bootstamp = 0;
 
@@ -216,7 +216,7 @@ int timeout = -1; //in seconds
 
 volatile sig_atomic_t timeout_occurred = 0;
 
-static __u64 cnt = 0;
+
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
                            va_list args) {
   if (level == LIBBPF_DEBUG) return 0;
@@ -273,35 +273,9 @@ typedef struct osd_op {
   __u64 op_lat;
 } osd_op_t;
 
-struct op_stat_s {
-  __u64 recv_lat;
-  __u64 dispatch_lat;
-  __u64 queue_lat;
-  __u64 osd_lat;
-  __u64 bluestore_alloc_lat;
-  __u64 bluestore_data_lat;
-  __u64 bluestore_kv_lat;
-  __u64 bluestore_lat;
-  __u64 op_lat;
-  __u64 r_cnt;
-  __u64 w_cnt;
-  __u64 rbytes;
-  __u64 wbytes;
-  __u64 max_recv_lat;
-  __u64 max_dispatch_lat;
-  __u64 max_queue_lat;
-  __u64 max_osd_lat;
-  __u64 max_bluestore_lat;
-  __u64 max_op_lat;
-  int aio_size;
-};
 int num_osd = 0;
 int osds[MAX_OSD] = {0};
 int pids[MAX_OSD] = {0};
-struct op_stat_s op_stat[MAX_OSD];
-
-struct timespec lasttime;
-__u32 period = 0;
 
 //@write
 //(0, 4k) num {min=, max=, avg=, 10%=, 50%=, 90%=, 95%=, 99%=, 99.9%=}
@@ -714,124 +688,7 @@ void handle_full(struct op_v *val, int osd_id) {
     }
 }
 
-void handle_avg(struct op_v *val, int osd_id) {
 
-  __u64 recv_stamp = val->recv_stamp;
-  if (val->throttle_stamp < val->recv_stamp) {
-      //Due to recv_stamp bug https://tracker.ceph.com/issues/52739
-      //Releases older than 16.2.7, the recv_stamp is not accurate at all
-      //Hence we'll use the throttle_stamp as the recv_stamp, which will only lose 1-3 microseconds
-      recv_stamp = val->throttle_stamp;
-  }
-
-  op_stat[osd_id].recv_lat += (val->recv_complete_stamp - recv_stamp);
-  op_stat[osd_id].max_recv_lat =
-      MAX(op_stat[osd_id].max_recv_lat,
-          (val->recv_complete_stamp - recv_stamp));
-  op_stat[osd_id].dispatch_lat +=
-      (val->enqueue_stamp - (val->recv_complete_stamp - bootstamp));
-  op_stat[osd_id].max_dispatch_lat =
-      MAX(op_stat[osd_id].max_dispatch_lat,
-          (val->enqueue_stamp - (val->recv_complete_stamp - bootstamp)));
-  op_stat[osd_id].queue_lat += (val->dequeue_stamp - val->enqueue_stamp);
-  op_stat[osd_id].max_queue_lat = MAX(
-      op_stat[osd_id].max_queue_lat, (val->dequeue_stamp - val->enqueue_stamp));
-  op_stat[osd_id].osd_lat +=
-      (val->queue_transaction_stamp - val->dequeue_stamp);
-  op_stat[osd_id].max_osd_lat =
-      MAX(op_stat[osd_id].max_osd_lat,
-          (val->queue_transaction_stamp - val->dequeue_stamp));
-  op_stat[osd_id].bluestore_alloc_lat +=
-      (val->aio_done_stamp - val->do_write_stamp);
-  op_stat[osd_id].bluestore_data_lat +=
-      (val->aio_done_stamp - val->aio_submit_stamp);
-  op_stat[osd_id].bluestore_kv_lat +=
-      (val->kv_committed_stamp - val->kv_submit_stamp);
-  op_stat[osd_id].bluestore_lat +=
-      (val->kv_committed_stamp - val->queue_transaction_stamp);
-  op_stat[osd_id].max_bluestore_lat =
-      MAX(op_stat[osd_id].max_bluestore_lat,
-          (val->kv_committed_stamp - val->queue_transaction_stamp));
-  op_stat[osd_id].op_lat += (val->reply_stamp - (recv_stamp - bootstamp));
-  op_stat[osd_id].max_op_lat =
-      MAX(op_stat[osd_id].max_op_lat,
-          (val->reply_stamp - (recv_stamp - bootstamp)));
-  op_stat[osd_id].r_cnt += (val->rb ? 1 : 0);
-  op_stat[osd_id].w_cnt += (val->wb ? 1 : 0);
-  op_stat[osd_id].rbytes += val->rb;
-  op_stat[osd_id].wbytes += val->wb;
-
-  // printf("Number is %lld Client.%lld tid %lld recv_stamp %lld
-  // recv_complete_stamp %lld dispatch_stamp %lld enqueue_stamp %lld
-  // dequeue_stamp %lld execute_ctx_stamp %lld submit_transaction %lld
-  // do_write_stamp %lld wctx_finish_stamp %lld data_submit_stamp %lld
-  // data_committed_stamp %lld kv_submit_stamp %lld kv_committed_stamp %lld
-  // reply_stamp %lld write_bytes %lld read_bytes %lld\n",cnt, val->owner,
-  // val->tid, val->recv_stamp-bootstamp, val->recv_complete_stamp-bootstamp,
-  // val->dispatch_stamp-bootstamp, val->enqueue_stamp, val->dequeue_stamp,
-  // val->execute_ctx_stamp, val->submit_transaction_stamp, val->do_write_stamp,
-  // val->wctx_finish_stamp, val->data_submit_stamp, val->data_committed_stamp,
-  // val->kv_submit_stamp, val->kv_committed_stamp, val->reply_stamp, val->wb,
-  // val->rb);
-  struct timespec now;
-  clock_gettime(CLOCK_BOOTTIME, &now);
-  __u64 interval = timespec_sub_ms(&now, &lasttime);
-  if (interval >= period * 1000) {
-    int interval_s = MAX(1, interval / 1000);
-    if (period > 0)
-      printf(
-          "OSD  r/s    w/s    rkB/s    wkB/s     rcv_lat     disp_lat      "
-          "qu_lat      osd_lat   bs_alloc_lat    bs_data_lat      bs_kv_lat    "
-          "    op_lat\n");
-    for (int i = 0; i < num_osd; ++i) {
-      osd_id = osds[i];
-      cnt = op_stat[osd_id].w_cnt + op_stat[osd_id].r_cnt;
-      if (cnt == 0 && period == 0) continue;
-      cnt = MAX(cnt, 1);
-      printf(
-          "%3d "
-          "%4lld%7lld%9lld%9lld%12.3f%13.3f%12.3f%13.3f%15.3f%15.3f%15.3f%14."
-          "3f \n",
-          osd_id, op_stat[osd_id].r_cnt / interval_s,
-          op_stat[osd_id].w_cnt / interval_s,
-          op_stat[osd_id].rbytes / interval_s / 1024,
-          op_stat[osd_id].wbytes / interval_s / 1024,
-          mode == MODE_AVG ? (op_stat[osd_id].recv_lat / cnt / 1000.0)
-                           : (op_stat[osd_id].max_recv_lat / 1000.0),
-          mode == MODE_AVG ? (op_stat[osd_id].dispatch_lat / cnt / 1000.0)
-                           : (op_stat[osd_id].max_dispatch_lat / 1000.0),
-          mode == MODE_AVG ? (op_stat[osd_id].queue_lat / cnt / 1000.0)
-                           : (op_stat[osd_id].max_queue_lat / 1000.0),
-          mode == MODE_AVG ? (op_stat[osd_id].osd_lat / cnt / 1000.0)
-                           : (op_stat[osd_id].max_osd_lat / 1000.0),
-          mode == MODE_AVG
-              ? (op_stat[osd_id].bluestore_alloc_lat / cnt / 1000.0)
-              : 0,
-          mode == MODE_AVG ? (op_stat[osd_id].bluestore_data_lat / cnt / 1000.0)
-                           : 0,
-          mode == MODE_AVG ? (op_stat[osd_id].bluestore_kv_lat / cnt / 1000.0)
-                           : 0,
-          // mode == MODE_AVG ? (op_stat[osd_id].bluestore_lat/cnt / 1000.0) :
-          // (op_stat[osd_id].max_bluestore_lat / 1000.0),
-          mode == MODE_AVG ? (op_stat[osd_id].op_lat / cnt / 1000.0)
-                           : (op_stat[osd_id].max_op_lat / 1000.0));
-      memset(&op_stat[osd_id], 0, sizeof(op_stat[osd_id]));
-    }
-    if (period > 0) printf("\n\n");
-    lasttime = now;
-  }
-
-  // printf("Number is %lld Client.%lld tid %lld recv_stamp %lld
-  // recv_complete_stamp %lld dispatch_stamp %lld enqueue_stamp %lld
-  // dequeue_stamp %lld execute_ctx_stamp %lld submit_transaction %lld
-  // reply_stamp %lld write_bytes %lld read_bytes %lld\n",cnt, val->owner,
-  // val->tid, val->recv_stamp-bootstamp, val->recv_complete_stamp-bootstamp,
-  // val->dispatch_stamp-bootstamp, val->enqueue_stamp, val->dequeue_stamp,
-  // val->execute_ctx_stamp, val->submit_transaction_stamp, val->reply_stamp,
-  // val->wb, val->rb); printf("The current number is %lld Client.%lld tid %lld
-  // enqueue_stamp %lld dequeue_stamp %lld\n",cnt, val->owner, val->tid,
-  // val->enqueue_stamp, val->dequeue_stamp);
-}
 
 void handle_bluestore(struct bluestore_lat_v *val, int osd_id) {
     __u64 lat_us = val->lat / 1000;
@@ -985,12 +842,7 @@ static int handle_event(void *ctx, void *data, size_t size) {
     if (probe_mode == OP_SINGLE_PROBE) {
       handle_single(val, osd_id);
     } else if (probe_mode & OP_FULL_PROBE) {
-      if (mode == MODE_AVG) {
-        clog << "avg mode needs to be refined" << endl;
-        //handle_avg(val, osd_id);
-      } else if (mode == MODE_ALL){
-        handle_full(val, osd_id);
-      }
+      handle_full(val, osd_id);
     }
   } else if (is_bluestore_event && (probe_mode & BLUESTORE_PROBE)) {
     struct bluestore_lat_v *val = (struct bluestore_lat_v *) data;
@@ -1123,7 +975,7 @@ int parse_args(int argc, char **argv) {
   // it in a plain char is unsafe on platforms where char is unsigned by
   // default (the `!= -1` test can then loop forever).  Match kfstrace.
   int opt;
-  while ((opt = getopt_long(argc, argv, ":d:m:t:xbj:i:l:p:V", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, ":st:bj:i:l:p:V", long_options, &option_index)) != -1) {
     switch (opt) {
       case 0:
         // Handle long options
@@ -1152,24 +1004,13 @@ int parse_args(int argc, char **argv) {
       case 'V':
         print_tool_version("osdtrace");
         exit(0);
-      case 'd':
-        period = optarg[0] - '0';
-        break;
-      case 'm':
-        if (0 == strcmp(optarg, "avg")) {
-          mode = MODE_AVG;
-        } else if (0 == strcmp(optarg, "max")) {
-          mode = MODE_MAX;
-        } else {
-          clog << "Unknown mode" << endl;
-          return -1;
-        }
+
+      case 's':
+        probe_mode &= ~OP_FULL_PROBE;
+        probe_mode |= OP_SINGLE_PROBE;
         break;
       case 'l':
         threshold = stoi(optarg);
-        break;
-      case 'x':
-        probe_mode |= OP_FULL_PROBE;
         break;
       case 'b':
         probe_mode |= BLUESTORE_PROBE;
@@ -1209,11 +1050,9 @@ int parse_args(int argc, char **argv) {
         break;
       case '?':
       case 'h':
-        std::cout << "Usage: " << argv[0] << " [-d <seconds>] [-m <avg|max>] [-l <milliseconds>] [-x] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--id <osd-id1,osd-id2,...>] [--skip-version-check] [--list]\n";
-        std::cout << "  -d <seconds>              Set probe duration in seconds to calculate average latency\n";
-        std::cout << "  -m <avg|max>              Set operation latency collection mode\n";
+        std::cout << "Usage: " << argv[0] << " [-s] [-l <milliseconds>] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--id <osd-id1,osd-id2,...>] [--skip-version-check] [--list]\n";
+        std::cout << "  -s                        Set probe mode to Single OP (logs PrimaryLogPG::log_op_stats only)\n";
         std::cout << "  -l <milliseconds>         Set operation latency threshold to capture\n";
-        std::cout << "  -x                        Set probe mode to Full OPs\n";
         std::cout << "  -b                        Set probe mode to Bluestore\n";
         std::cout << "  -j                        Export DWARF info to JSON file\n";
         std::cout << "  -i <filename>             Import DWARF info from JSON file\n";
@@ -1640,9 +1479,6 @@ int main(int argc, char **argv) {
   }
 
   clog << "Started to poll from ring buffer" << endl;
-
-  clock_gettime(CLOCK_BOOTTIME, &lasttime);
-  memset(op_stat, 0, MAX_OSD * sizeof(op_stat[0]));
 
   while ((!timeout_occurred || timeout == -1) && (ret = ring_buffer__poll(rb, 1000)) >= 0) {
       // Continue polling while timeout hasn't occurred or if unlimited execution time
