@@ -1327,8 +1327,14 @@ int main(int argc, char **argv) {
       return 1;
     }
 
-    // Host binary found - auto-detect and print active OSD processes to inform the user
-    if (processes.empty()) {
+    // Host binary found - this default mode traces the on-host ceph-osd binary,
+    // so only host (non-containerized) OSD processes are relevant.  Containerized
+    // OSDs can't be traced this way (use -p/--id), so exclude them from the list.
+    std::vector<OsdProcessInfo> host_processes;
+    for (const auto& p : processes) {
+      if (!p.is_container) host_processes.push_back(p);
+    }
+    if (host_processes.empty()) {
       std::cout << "Warning: No active ceph-osd processes detected on the host." << std::endl;
       std::cout << "osdtrace will start tracing globally, but no events will be captured until a ceph-osd process runs." << std::endl;
     } else {
@@ -1336,7 +1342,7 @@ int main(int argc, char **argv) {
         std::cout << "Warning: Running without root privileges. Containerized status of OSDs owned by other users may not be accurately detected." << std::endl << std::endl;
       }
       std::cout << "Detected active ceph-osd process(es) on the host:" << std::endl;
-      print_discovered_osds(processes);
+      print_discovered_osds(host_processes);
       std::cout << std::endl;
     }
   }
