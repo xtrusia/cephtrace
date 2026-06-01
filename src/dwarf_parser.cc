@@ -1000,10 +1000,12 @@ bool DwarfParser::import_from_json(const std::string& filename, const std::strin
     }
 }
 
-bool DwarfParser::import_from_embedded(
+// Find the embedded entry whose per-module build-ids match the caller's set,
+// or nullptr if none.  Shared by import_from_embedded() (which then loads the
+// data) and is_embedded_traceable() (which only reports the verdict).
+static const EmbeddedVersion* find_embedded_match(
     const std::vector<std::pair<std::string, std::string>>& modules,
-    const std::string& trace_type,
-    std::string* matched_version_out) {
+    const std::string& trace_type) {
     const EmbeddedVersion* versions = nullptr;
     int count = 0;
 
@@ -1014,8 +1016,7 @@ bool DwarfParser::import_from_embedded(
         versions = EMBEDDED_RADOSTRACE_VERSIONS;
         count = EMBEDDED_RADOSTRACE_COUNT;
     } else {
-        std::cerr << "Unknown trace type: " << trace_type << std::endl;
-        return false;
+        return nullptr;
     }
 
     // Build the caller's (basename, build-id) set.  An empty build-id on
@@ -1027,12 +1028,12 @@ bool DwarfParser::import_from_embedded(
     std::set<std::pair<std::string, std::string>> want;
     for (const auto& m : modules) {
         if (m.second.empty()) {
-            return false;
+            return nullptr;
         }
         want.emplace(m.first, m.second);
     }
     if (want.empty()) {
-        return false;
+        return nullptr;
     }
 
     // Linear scan: an entry matches iff every module it lists is present in
@@ -1046,7 +1047,6 @@ bool DwarfParser::import_from_embedded(
     // confuse two different package versions.  Any empty build-id in the
     // embedded data disqualifies that entry (legacy JSONs predating the
     // build-id scheme).
-    const EmbeddedVersion* match = nullptr;
     for (int i = 0; i < count; ++i) {
         const EmbeddedVersion& v = versions[i];
         if (v.num_modules == 0) continue;
@@ -1059,11 +1059,18 @@ bool DwarfParser::import_from_embedded(
             if (it == want.end()) { all_match = false; break; }
         }
         if (all_match) {
-            match = &v;
-            break;
+            return &v;
         }
     }
 
+    return nullptr;
+}
+
+bool DwarfParser::import_from_embedded(
+    const std::vector<std::pair<std::string, std::string>>& modules,
+    const std::string& trace_type,
+    std::string* matched_version_out) {
+    const EmbeddedVersion* match = find_embedded_match(modules, trace_type);
     if (!match) {
         return false;
     }
@@ -1166,6 +1173,20 @@ void DwarfParser::list_embedded_versions(const std::string& trace_type) {
                         m == 0 ? ver : "", m == 0 ? arch : "", mod, bid);
         }
     }
+}
+
+bool DwarfParser::is_embedded_traceable(
+    const std::vector<std::pair<std::string, std::string>>& modules,
+    const std::string& trace_type,
+    std::string* matched_version_out) {
+    const EmbeddedVersion* match = find_embedded_match(modules, trace_type);
+    if (!match) {
+        return false;
+    }
+    if (matched_version_out && match->version) {
+        *matched_version_out = match->version;
+    }
+    return true;
 }
 
 const char* DwarfParser::dwarf_attr_string(unsigned int attrnum) {
