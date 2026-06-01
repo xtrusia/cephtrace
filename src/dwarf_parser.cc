@@ -1144,8 +1144,8 @@ void DwarfParser::list_embedded_versions(const std::string& trace_type) {
 
     std::cout << count << " Ceph version(s) with embedded " << trace_type
               << " DWARF data:" << std::endl;
-    std::printf("  %-32s %-8s %-22s %s\n", "VERSION", "ARCH", "MODULE", "BUILD ID");
-    std::printf("  %-32s %-8s %-22s %s\n",
+    printf("  %-32s %-8s %-22s %s\n", "VERSION", "ARCH", "MODULE", "BUILD ID");
+    printf("  %-32s %-8s %-22s %s\n",
                 "--------------------------------", "--------",
                 "----------------------", "----------------------------------------");
     for (int i = 0; i < count; ++i) {
@@ -1153,7 +1153,7 @@ void DwarfParser::list_embedded_versions(const std::string& trace_type) {
         const char* ver = (v.version && *v.version) ? v.version : "(unknown)";
         const char* arch = (v.arch && *v.arch) ? v.arch : "-";
         if (v.num_modules == 0) {
-            std::printf("  %-32s %-8s %-22s %s\n", ver, arch, "-", "-");
+            printf("  %-32s %-8s %-22s %s\n", ver, arch, "-", "-");
             continue;
         }
         // One row per module; repeat version/arch only on the first row so a
@@ -1162,7 +1162,7 @@ void DwarfParser::list_embedded_versions(const std::string& trace_type) {
             const char* mod = v.modules[m].module_name ? v.modules[m].module_name : "-";
             const char* bid = (v.modules[m].build_id && *v.modules[m].build_id)
                                   ? v.modules[m].build_id : "(none)";
-            std::printf("  %-32s %-8s %-22s %s\n",
+            printf("  %-32s %-8s %-22s %s\n",
                         m == 0 ? ver : "", m == 0 ? arch : "", mod, bid);
         }
     }
