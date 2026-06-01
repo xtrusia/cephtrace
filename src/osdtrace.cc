@@ -1262,8 +1262,6 @@ int main(int argc, char **argv) {
   int ret = 0;
   struct ring_buffer *rb;
 
-  clog << "Start to parse ceph dwarf info" << endl;
-
   std::string osd_path;
 
   if (!process_ids.empty()) {
@@ -1300,16 +1298,43 @@ int main(int argc, char **argv) {
       }
     }
   } else {
-    // No PID specified - search for ceph-osd on the system
+    // No PID specified - look for a host-side ceph-osd binary, and separately
+    // discover running ceph-osd processes.  Discovery scans /proc, so it sees
+    // containerized OSDs too, even though their binary is not on the host FS.
     osd_path = find_executable_path("ceph-osd");
+    auto processes = discover_ceph_osd_processes();
+
     if (osd_path.empty()) {
-      std::cerr << "Error: Could not find ceph-osd executable" << std::endl;
+      // No ceph-osd on the host filesystem.  This is the normal case when OSDs
+      // run inside containers: the binary lives in the container image, so
+      // there is nothing for us to read on the host without attaching to a
+      // specific PID.  Instead of failing cryptically, show what we can see
+      // and how to attach to it.
+      if (!processes.empty()) {
+        if (geteuid() != 0) {
+          std::cerr << "Warning: Running without root privileges. Containerized status of OSDs owned by other users may not be accurately detected." << std::endl << std::endl;
+        }
+        std::cerr << "Error: no ceph-osd binary found on the host, but "
+                  << processes.size() << " running ceph-osd process(es) were detected"
+                  << " (your OSDs are likely containerized)." << std::endl;
+        print_discovered_osds(processes);
+        std::cerr << std::endl;
+        std::cerr << "Use -p or --id to specify one or multiple OSD(s) to trace containerized OSDs." << std::endl;
+      } else {
+        std::cerr << "Error: no ceph-osd binary found on the host and no running ceph-osd processes detected." << std::endl;
+        std::cerr << "If your OSDs run in containers, make sure they are running, then trace by OSD ID (--id) or PID (-p)." << std::endl;
+      }
       return 1;
     }
 
-    // Auto-detect and print active OSD processes to inform the user
-    auto processes = discover_ceph_osd_processes();
-    if (processes.empty()) {
+    // Host binary found - this default mode traces the on-host ceph-osd binary,
+    // so only host (non-containerized) OSD processes are relevant.  Containerized
+    // OSDs can't be traced this way (use -p/--id), so exclude them from the list.
+    std::vector<OsdProcessInfo> host_processes;
+    for (const auto& p : processes) {
+      if (!p.is_container) host_processes.push_back(p);
+    }
+    if (host_processes.empty()) {
       std::cout << "Warning: No active ceph-osd processes detected on the host." << std::endl;
       std::cout << "osdtrace will start tracing globally, but no events will be captured until a ceph-osd process runs." << std::endl;
     } else {
@@ -1317,7 +1342,7 @@ int main(int argc, char **argv) {
         std::cout << "Warning: Running without root privileges. Containerized status of OSDs owned by other users may not be accurately detected." << std::endl << std::endl;
       }
       std::cout << "Detected active ceph-osd process(es) on the host:" << std::endl;
-      print_discovered_osds(processes);
+      print_discovered_osds(host_processes);
       std::cout << std::endl;
     }
   }
