@@ -871,6 +871,7 @@ bool import_json = false;
 bool export_json = false;
 bool skip_version_check = false;
 bool list_only = false;
+bool list_embedded = false;
 
 struct OsdProcessInfo {
   int pid;
@@ -966,6 +967,7 @@ int parse_args(int argc, char **argv) {
     {"skip-version-check", no_argument, 0, 0},
     {"version", no_argument, 0, 'V'},
     {"list", no_argument, 0, 0},
+    {"list-embedded", no_argument, 0, 0},
     {"id", required_argument, 0, 0},
     {0, 0, 0, 0}
   };
@@ -983,6 +985,8 @@ int parse_args(int argc, char **argv) {
           skip_version_check = true;
         } else if (strcmp(long_options[option_index].name, "list") == 0) {
           list_only = true;
+        } else if (strcmp(long_options[option_index].name, "list-embedded") == 0) {
+          list_embedded = true;
         } else if (strcmp(long_options[option_index].name, "id") == 0) {
           std::stringstream ss(optarg);
           std::string token;
@@ -1050,7 +1054,7 @@ int parse_args(int argc, char **argv) {
         break;
       case '?':
       case 'h':
-        std::cout << "Usage: " << argv[0] << " [-s] [-l <milliseconds>] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--id <osd-id1,osd-id2,...>] [--skip-version-check] [--list]\n";
+        std::cout << "Usage: " << argv[0] << " [-s] [-l <milliseconds>] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--id <osd-id1,osd-id2,...>] [--skip-version-check] [--list] [--list-embedded]\n";
         std::cout << "  -s                        Set probe mode to Single OP (logs PrimaryLogPG::log_op_stats only)\n";
         std::cout << "  -l <milliseconds>         Set operation latency threshold to capture\n";
         std::cout << "  -b                        Set probe mode to Bluestore\n";
@@ -1061,6 +1065,7 @@ int parse_args(int argc, char **argv) {
         std::cout << "  --id <osd-id1,osd-id2,...> Probe by OSD ID (comma-separated; resolves to PIDs via discovery)\n";
         std::cout << "  --skip-version-check      Skip version check when importing DWARF JSON (currently needed for containers)\n";
         std::cout << "  --list                    List active ceph-osd processes on the host, their PIDs and OSD IDs, and exit\n";
+        std::cout << "  --list-embedded           List the Ceph versions with DWARF data compiled into this binary, and exit\n";
         std::cout << "  -V, --version             Print version information and exit\n";
         std::cout << "  -h                        Show this help message\n";
         exit(0);
@@ -1205,6 +1210,11 @@ int main(int argc, char **argv) {
   signal(SIGINT, signal_handler);
 
   if (parse_args(argc, argv) < 0) return 0;
+
+  if (list_embedded) {
+    DwarfParser::list_embedded_versions("osdtrace");
+    return 0;
+  }
 
   if (list_only) {
     if (geteuid() != 0) {
