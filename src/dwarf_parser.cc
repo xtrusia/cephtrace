@@ -1127,6 +1127,47 @@ bool DwarfParser::import_from_embedded(
     return true;
 }
 
+void DwarfParser::list_embedded_versions(const std::string& trace_type) {
+    const EmbeddedVersion* versions = nullptr;
+    int count = 0;
+
+    if (trace_type == "osdtrace") {
+        versions = EMBEDDED_OSDTRACE_VERSIONS;
+        count = EMBEDDED_OSDTRACE_COUNT;
+    } else if (trace_type == "radostrace") {
+        versions = EMBEDDED_RADOSTRACE_VERSIONS;
+        count = EMBEDDED_RADOSTRACE_COUNT;
+    } else {
+        std::cerr << "Unknown trace type: " << trace_type << std::endl;
+        return;
+    }
+
+    std::cout << count << " Ceph version(s) with embedded " << trace_type
+              << " DWARF data:" << std::endl;
+    printf("  %-32s %-8s %-22s %s\n", "VERSION", "ARCH", "MODULE", "BUILD ID");
+    printf("  %-32s %-8s %-22s %s\n",
+                "--------------------------------", "--------",
+                "----------------------", "----------------------------------------");
+    for (int i = 0; i < count; ++i) {
+        const EmbeddedVersion& v = versions[i];
+        const char* ver = (v.version && *v.version) ? v.version : "(unknown)";
+        const char* arch = (v.arch && *v.arch) ? v.arch : "-";
+        if (v.num_modules == 0) {
+            printf("  %-32s %-8s %-22s %s\n", ver, arch, "-", "-");
+            continue;
+        }
+        // One row per module; repeat version/arch only on the first row so a
+        // multi-module entry (radostrace) reads as a single grouped record.
+        for (int m = 0; m < v.num_modules; ++m) {
+            const char* mod = v.modules[m].module_name ? v.modules[m].module_name : "-";
+            const char* bid = (v.modules[m].build_id && *v.modules[m].build_id)
+                                  ? v.modules[m].build_id : "(none)";
+            printf("  %-32s %-8s %-22s %s\n",
+                        m == 0 ? ver : "", m == 0 ? arch : "", mod, bid);
+        }
+    }
+}
+
 const char* DwarfParser::dwarf_attr_string(unsigned int attrnum) {
   switch (attrnum) {
     #define DWARF_ONE_KNOWN_DW_AT(NAME, CODE) case CODE: return  "DW_AT_"#NAME;

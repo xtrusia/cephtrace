@@ -68,6 +68,30 @@ if [ ! -f "$PROJECT_ROOT/radostrace" ]; then
     exit 1
 fi
 
+info "=== Step 0: Verify --list-embedded lists compiled-in DWARF versions ==="
+# No cluster needed: --list-embedded just prints the DWARF versions baked into
+# the binary and exits 0.  Assert both tools succeed, print the table header,
+# and report at least one embedded version.
+for tool in osdtrace radostrace; do
+    if ! list_out=$("$PROJECT_ROOT/$tool" --list-embedded 2>&1); then
+        err "$tool --list-embedded exited non-zero"
+        echo "$list_out" >&2
+        exit 1
+    fi
+    if ! grep -q "VERSION" <<<"$list_out" || ! grep -q "BUILD ID" <<<"$list_out"; then
+        err "$tool --list-embedded missing expected table header"
+        echo "$list_out" >&2
+        exit 1
+    fi
+    count=$(sed -n 's/^\([0-9][0-9]*\) Ceph version.*/\1/p' <<<"$list_out")
+    if [ -z "$count" ] || [ "$count" -lt 1 ]; then
+        err "$tool --list-embedded reported no embedded versions"
+        echo "$list_out" >&2
+        exit 1
+    fi
+    info "✓ $tool --list-embedded: $count embedded version(s)"
+done
+
 info "=== Step 1: Setup MicroCeph (install + bootstrap + OSDs + wait healthy) ==="
 if ! microceph_setup_single_node 3 3G 120; then
     err "MicroCeph cluster did not become healthy within timeout"

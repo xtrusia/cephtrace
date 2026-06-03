@@ -127,6 +127,15 @@ class DwarfParser {
       const std::string& trace_type,
       std::string* matched_version_out = nullptr);
 
+  /**
+   * Print the Ceph versions for which DWARF data is compiled into this
+   * binary (one row per embedded module, with its build-id), to stdout.
+   *
+   * @param trace_type "osdtrace" or "radostrace" — selects which embedded
+   *                   table to enumerate.
+   */
+  static void list_embedded_versions(const std::string& trace_type);
+
   static const char* dwarf_attr_string(unsigned int attrnum);
   static const char* dwarf_form_string(unsigned int form);
 };
