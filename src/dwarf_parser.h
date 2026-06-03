@@ -136,6 +136,24 @@ class DwarfParser {
    */
   static void list_embedded_versions(const std::string& trace_type);
 
+  /**
+   * Report whether the compiled-in embedded DWARF data covers the given
+   * modules, without loading anything (unlike import_from_embedded, this is
+   * side-effect free and emits no log output).  Matching is by build-id with
+   * the same semantics as import_from_embedded.
+   *
+   * @param modules            (basename, hex build-id) pairs, as for
+   *                           import_from_embedded.
+   * @param trace_type         "osdtrace" or "radostrace".
+   * @param matched_version_out If non-null, set to the matched version on a
+   *                           positive verdict.
+   * @return true if the target is traceable with embedded data alone.
+   */
+  static bool is_embedded_traceable(
+      const std::vector<std::pair<std::string, std::string>>& modules,
+      const std::string& trace_type,
+      std::string* matched_version_out = nullptr);
+
   static const char* dwarf_attr_string(unsigned int attrnum);
   static const char* dwarf_form_string(unsigned int form);
 };

@@ -878,6 +878,10 @@ struct OsdProcessInfo {
   int osd_id;
   std::string exe_path;
   bool is_container;
+  // Embedded-DWARF traceability verdict, populated lazily by
+  // annotate_traceability() for the --list path only: "yes", "no", "unknown"
+  // (empty until computed).
+  std::string traceable;
 };
 
 std::string get_mnt_ns(int pid) {
@@ -932,7 +936,7 @@ std::vector<OsdProcessInfo> discover_ceph_osd_processes() {
             is_container = true;
           }
           
-          results.push_back({pid, osd_id, exe_path, is_container});
+          results.push_back({pid, osd_id, exe_path, is_container, ""});
         }
       }
     }
@@ -950,13 +954,43 @@ std::vector<OsdProcessInfo> discover_ceph_osd_processes() {
   return results;
 }
 
-void print_discovered_osds(const std::vector<OsdProcessInfo>& processes) {
-  printf("  %-10s %-10s %-12s %-50s\n", "PID", "OSD ID", "Container", "Executable Path");
-  printf("  --------------------------------------------------------------------------------\n");
+void print_discovered_osds(const std::vector<OsdProcessInfo>& processes,
+                           bool show_traceable = false) {
+  if (show_traceable) {
+    printf("  %-10s %-10s %-12s %-11s %-50s\n", "PID", "OSD ID", "Container", "Traceable", "Executable Path");
+    printf("  --------------------------------------------------------------------------------------------\n");
+  } else {
+    printf("  %-10s %-10s %-12s %-50s\n", "PID", "OSD ID", "Container", "Executable Path");
+    printf("  --------------------------------------------------------------------------------\n");
+  }
   for (const auto& proc : processes) {
     std::string osd_id_str = (proc.osd_id == -1) ? "unknown" : std::to_string(proc.osd_id);
     std::string container_str = proc.is_container ? "yes" : "no";
-    printf("  %-10d %-10s %-12s %-50s\n", proc.pid, osd_id_str.c_str(), container_str.c_str(), proc.exe_path.c_str());
+    if (show_traceable) {
+      std::string traceable_str = proc.traceable.empty() ? "unknown" : proc.traceable;
+      printf("  %-10d %-10s %-12s %-11s %-50s\n", proc.pid, osd_id_str.c_str(),
+             container_str.c_str(), traceable_str.c_str(), proc.exe_path.c_str());
+    } else {
+      printf("  %-10d %-10s %-12s %-50s\n", proc.pid, osd_id_str.c_str(), container_str.c_str(), proc.exe_path.c_str());
+    }
+  }
+}
+
+// Fill in each process's `traceable` verdict by reading the build-id of the
+// binary the uprobes would attach to (bridged through /proc/<pid>/root so
+// containerized OSDs resolve to the in-container binary) and checking it
+// against the compiled-in embedded DWARF table.  Reading another process's
+// (or a container's) binary requires root; otherwise the verdict is "unknown".
+void annotate_traceability(std::vector<OsdProcessInfo>& processes) {
+  for (auto& proc : processes) {
+    std::string bridged_path = "/proc/" + std::to_string(proc.pid) + "/root" + proc.exe_path;
+    std::string build_id = get_elf_build_id(bridged_path);
+    if (build_id.empty()) {
+      proc.traceable = "unknown";
+      continue;
+    }
+    proc.traceable = DwarfParser::is_embedded_traceable(
+        {{get_basename(proc.exe_path), build_id}}, "osdtrace") ? "yes" : "no";
   }
 }
 
@@ -1224,8 +1258,29 @@ int main(int argc, char **argv) {
     if (processes.empty()) {
       std::cout << "No active ceph-osd processes detected on the host." << std::endl;
     } else {
+      annotate_traceability(processes);
       std::cout << "Detected " << processes.size() << " active ceph-osd process(es) on the host:" << std::endl;
-      print_discovered_osds(processes);
+      print_discovered_osds(processes, /*show_traceable=*/true);
+
+      // If any OSD isn't directly traceable, tell the user how to proceed.
+      bool any_no = false, any_unknown = false;
+      for (const auto& proc : processes) {
+        if (proc.traceable == "no") any_no = true;
+        else if (proc.traceable == "unknown") any_unknown = true;
+      }
+      if (any_no || any_unknown) {
+        std::cout << std::endl
+                  << "Traceable: 'yes' means this osdtrace already has matching DWARF data built in." << std::endl;
+        if (any_no) {
+          std::cout << "  'no':      no embedded DWARF matches this binary's build-id. Export a DWARF JSON" << std::endl;
+          std::cout << "             on a host that has the matching ceph-osd (osdtrace -j <file>), then trace" << std::endl;
+          std::cout << "             with: osdtrace -p <pid> -i <file> --skip-version-check" << std::endl;
+        }
+        if (any_unknown) {
+          std::cout << "  'unknown': could not read the OSD binary's build-id; re-run as root" << std::endl;
+          std::cout << "             (required for containerized OSDs)." << std::endl;
+        }
+      }
     }
     return 0;
   }
