@@ -1,0 +1,156 @@
+name: Refresh embedded DWARF for new Ceph releases
+
+# Phase 1 (this file): centos-stream / el9 only.  Detects newly-published
+# Ceph point releases (quincy / reef / squid / tentacle) on
+# download.ceph.com, generates osdtrace + radostrace DWARF JSONs for the
+# missing ones inside a disposable centos:stream9 podman container, and
+# opens a follow-up PR with the new files.
+#
+# Phases 2-3 (future): mirror the same detect/generate/PR flow for
+# quay.io container-image build-ids, then for Ubuntu / Cloud Archive /
+# Debian respin pockets, which need their own discovery and host
+# environment.  Each phase will be a sibling workflow file in this
+# directory so failures are scoped per-distro.
+
+on:
+  schedule:
+    # Weekly, Monday 06:00 UTC -- well after Ceph upstream's typical
+    # Friday/Tuesday point-release cadence.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:    # also runnable on demand from the Actions UI
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04
+    # Worst case: 15 missing versions * ~6 min/version = 90 min for the
+    # generators alone, plus ~5 min for the host build + ~5 min for the
+    # final rebuild + PR open.  120 min leaves headroom for slow downloads.
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout code and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install host build deps + podman
+        run: |
+            sudo apt-get update
+            sudo apt-get install -y g++ clang libelf-dev libc6-dev-i386 \
+                libdw-dev python3 podman
+
+      - name: Detect missing DWARF JSONs (centos-stream / el9)
+        id: detect
+        run: |
+            python3 tools/detect_missing_dwarf.py > /tmp/missing.tsv
+            echo "==== missing rows ===="
+            cat /tmp/missing.tsv
+            echo "===================="
+            COUNT=$(wc -l < /tmp/missing.tsv | tr -d ' ')
+            echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+            echo "Detected $COUNT missing JSON-set(s)."
+
+      - name: Exit early if nothing to do
+        if: steps.detect.outputs.count == '0'
+        run: |
+            echo "All upstream RPMs already have embedded DWARF JSONs."
+            echo "No PR will be opened."
+
+      - name: Build cephtrace on the host (used only for the final-rebuild gate)
+        if: steps.detect.outputs.count != '0'
+        run: make -j"$(nproc)" all
+
+      - name: Generate missing JSONs
+        if: steps.detect.outputs.count != '0'
+        id: generate
+        run: |
+            : > /tmp/succeeded.tsv
+            : > /tmp/failed.tsv
+            while IFS=$'\t' read -r distro tools version pkgver url; do
+                if ./tools/gen_dwarf_for_version.sh \
+                       "$distro" "$tools" "$version" "$pkgver"; then
+                    printf '%s\t%s\t%s\t%s\n' "$distro" "$tools" "$version" "$pkgver" \
+                        >> /tmp/succeeded.tsv
+                else
+                    printf '%s\t%s\t%s\t%s\n' "$distro" "$tools" "$version" "$pkgver" \
+                        >> /tmp/failed.tsv
+                    echo "::warning::dwarf generation failed for $version"
+                fi
+            done < /tmp/missing.tsv
+
+            S=$(wc -l < /tmp/succeeded.tsv | tr -d ' ')
+            F=$(wc -l < /tmp/failed.tsv | tr -d ' ')
+            echo "Generation summary: $S succeeded, $F failed."
+            echo "succeeded=$S" >> "$GITHUB_OUTPUT"
+            echo "failed=$F" >> "$GITHUB_OUTPUT"
+
+      - name: Re-aggregate embedded DWARF header + relink
+        # This step proves the new JSONs parse cleanly through
+        # tools/generate_embedded_dwarf.py and that osdtrace + radostrace
+        # still link with the larger header.  Failing here means one of
+        # the just-generated JSONs is malformed -- we want CI to catch that
+        # before the PR is opened, not after.
+        if: steps.generate.outputs.succeeded != '0'
+        run: |
+            make clean
+            make -j"$(nproc)" osdtrace radostrace
+
+      - name: Compose pull-request body
+        if: steps.generate.outputs.succeeded != '0'
+        run: |
+            {
+                echo "## Newly added embedded DWARF JSONs"
+                echo
+                echo "| distro | tools | version | pkgver |"
+                echo "|---|---|---|---|"
+                while IFS=$'\t' read -r d t v p; do
+                    printf '| %s | %s | %s | `%s` |\n' "$d" "$t" "$v" "$p"
+                done < /tmp/succeeded.tsv
+                echo
+                if [ -s /tmp/failed.tsv ]; then
+                    echo "## Versions that failed to generate"
+                    echo
+                    echo "These will be retried by the next scheduled run."
+                    echo
+                    echo '```'
+                    cat /tmp/failed.tsv
+                    echo '```'
+                    echo
+                fi
+                echo "## Verification"
+                echo "- \`tools/detect_missing_dwarf.py\` identified the rows above"
+                echo "  by probing \`download.ceph.com/rpm-X.Y.Z/el9/x86_64/\`."
+                echo "- Each JSON was generated inside a disposable"
+                echo "  \`quay.io/centos/centos:stream9\` container with the"
+                echo "  matching ceph-osd + lib*-debuginfo packages installed."
+                echo "- \`make -j\` re-aggregated the headers and linked"
+                echo "  \`osdtrace\` + \`radostrace\` cleanly."
+                echo
+                echo "_Generated by \`.github/workflows/refresh-embedded-dwarf.yaml\` ($(date -u +'%Y-%m-%d %H:%MZ'))._"
+            } > /tmp/pr_body.md
+            cat /tmp/pr_body.md
+
+      - name: Open pull request
+        if: steps.generate.outputs.succeeded != '0'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/refresh-embedded-dwarf-${{ github.run_id }}
+          delete-branch: true
+          title: "chore: refresh embedded DWARF for new Ceph releases"
+          commit-message: |
+            chore: refresh embedded DWARF for new Ceph point releases
+
+            Auto-generated by the refresh-embedded-dwarf workflow.
+            See PR body for the list of versions added.
+          body-path: /tmp/pr_body.md
+          labels: |
+            dwarf-refresh
+            automated
+          add-paths: |
+            files/centos-stream/osdtrace/*.json
+            files/centos-stream/radostrace/*.json
