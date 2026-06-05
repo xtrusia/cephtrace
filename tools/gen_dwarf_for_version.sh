@@ -47,13 +47,16 @@ trap cleanup EXIT
 
 echo "==> generating DWARF for centos-stream ${VERSION} (tools: ${TOOLS})"
 
-# --userns=keep-id: writes to bind-mounted files/ stay readable on the
-# host (default podman maps container root to a sub-uid range that the
-# host user can't write to without chowning afterward).  --privileged
-# isn't needed: we don't manipulate the BPF subsystem from inside the
-# container.
+# Run as container root (the rootless-podman default): dnf/rpm below
+# require superuser inside the container.  With rootless podman, container
+# UID 0 maps back to the invoking host user's UID, so files written to the
+# bind-mounted files/ are owned by the host user on the way out -- no
+# chown needed and `git status` picks them up directly.  (Do NOT use
+# --userns=keep-id here: it maps the container process to the host's
+# non-root UID, which makes dnf fail with "must be run as superuser".)
+# --privileged isn't needed: we don't manipulate the BPF subsystem from
+# inside the container.
 podman run -d --rm --name="$CTR" \
-    --userns=keep-id \
     -v "$REPO_ROOT":/workspace:Z \
     --workdir /workspace \
     quay.io/centos/centos:stream9 sleep infinity >/dev/null
@@ -61,29 +64,46 @@ podman run -d --rm --name="$CTR" \
 echo "==> installing build deps + ceph ${VERSION} + debuginfo"
 
 # crb enables glibc-devel.i686 + clang.  The build needs gdb only for the
-# starti trick below.
-podman exec "$CTR" dnf install -y --enablerepo=crb \
+# starti trick below.  --allowerasing lets dnf swap the image's preinstalled
+# curl-minimal for the full curl we request (they conflict otherwise).
+podman exec -u root "$CTR" dnf install -y --enablerepo=crb --allowerasing \
     gcc gcc-c++ clang make \
     elfutils-libelf-devel elfutils-devel \
     glibc-devel glibc-devel.i686 \
     python3 openssl-devel \
     gdb curl which >/dev/null
 
-# Install ceph-osd + the three core libraries plus *every* matching debuginfo
-# subpackage.  ceph-debuginfo + ceph-debugsource carry the inlined-frame
-# info that osdtrace's DWARF walker needs even when the symbol it's
-# resolving is in a per-binary -debuginfo package.
-podman exec "$CTR" bash -ec "
-    cd /tmp
-    pkgs='ceph-osd ceph-common librbd1 librados2
-          ceph-osd-debuginfo ceph-common-debuginfo
-          librbd1-debuginfo librados2-debuginfo
-          ceph-debuginfo ceph-debugsource'
-    for p in \$pkgs; do
-        curl -sfLO https://download.ceph.com/rpm-${VERSION}/el9/x86_64/\${p}-${VERSION}-0.el9.x86_64.rpm
-    done
-    rpm -ivh --force /tmp/*.rpm >/dev/null
-"
+# Install ceph-osd + the three core libraries plus every matching debuginfo
+# subpackage, WITH full dependency resolution.  A plain `rpm -ivh` can't pull
+# in the dozens of runtime deps (ceph-base, libaio, thrift, tcmalloc,
+# python3-rados, ...) that ceph-osd needs to even reach its entry point under
+# gdb, so we point dnf at the pinned per-release ceph repo -- which carries
+# both the regular and the -debuginfo/-debugsource RPMs -- and let it resolve
+# the closure.  EPEL supplies thrift / lttng-ust / libpmemobj.  ceph-debuginfo
+# + ceph-debugsource carry the inlined-frame info that osdtrace's DWARF walker
+# needs even when the symbol it's resolving is in a per-binary -debuginfo
+# package.
+podman exec -u root "$CTR" dnf install -y epel-release >/dev/null
+
+podman exec -i -u root "$CTR" \
+    bash -c 'cat > /etc/yum.repos.d/ceph-pinned.repo' <<EOF
+[ceph-pinned]
+name=ceph-pinned-${VERSION}-x86_64
+baseurl=https://download.ceph.com/rpm-${VERSION}/el9/x86_64/
+gpgcheck=0
+enabled=1
+[ceph-pinned-noarch]
+name=ceph-pinned-${VERSION}-noarch
+baseurl=https://download.ceph.com/rpm-${VERSION}/el9/noarch/
+gpgcheck=0
+enabled=1
+EOF
+
+podman exec -u root "$CTR" dnf install -y --enablerepo=crb \
+    ceph-osd ceph-common librbd1 librados2 \
+    ceph-osd-debuginfo ceph-common-debuginfo \
+    librbd1-debuginfo librados2-debuginfo \
+    ceph-debuginfo ceph-debugsource >/dev/null
 
 echo "==> building cephtrace inside the container"
 
@@ -103,23 +123,30 @@ echo "==> starting holder process (gdb starti on ceph-osd --version)"
 # ceph-osd's own initialisers run, so the process is harmless to hold
 # indefinitely.  The trailing `shell` command keeps gdb attached.
 podman exec "$CTR" bash -ec '
-    rm -f /tmp/osd_holder.pid /tmp/osd_pid
+    rm -f /tmp/osd_holder.pid /tmp/gdb.pid
     nohup gdb -nx -batch-silent \
         -ex "set follow-fork-mode parent" \
         -ex "set pagination off" \
         -ex "starti" \
         -ex "shell echo \$\$ > /tmp/osd_holder.pid; while true; do sleep 60; done" \
         --args /usr/bin/ceph-osd --version >/tmp/gdb.log 2>&1 &
+    echo $! > /tmp/gdb.pid
+    # osd_holder.pid is written by the gdb shell command, which only runs
+    # after starti -- its presence signals ceph-osd is stopped at its entry
+    # point and ready to be inspected.
     for i in $(seq 1 60); do
         [ -s /tmp/osd_holder.pid ] && break
         sleep 0.5
     done
 '
 
+# ceph-osd (the gdb inferior) and the keep-alive shell command are *both*
+# children of gdb, so locate ceph-osd via the gdb PID -- not via the holder
+# shell's PID, which would only match that shell's own children.
 OSD_PID=$(podman exec "$CTR" bash -ec '
-    HOLDER=$(cat /tmp/osd_holder.pid 2>/dev/null || true)
-    [ -n "$HOLDER" ] || { echo "gdb holder did not start" >&2; cat /tmp/gdb.log >&2; exit 1; }
-    OSD=$(pgrep -P "$HOLDER" -x ceph-osd || true)
+    GDB=$(cat /tmp/gdb.pid 2>/dev/null || true)
+    [ -n "$GDB" ] || { echo "gdb did not start" >&2; cat /tmp/gdb.log >&2; exit 1; }
+    OSD=$(pgrep -P "$GDB" -x ceph-osd || true)
     [ -n "$OSD" ] || { echo "ceph-osd subprocess not found" >&2; ps -ef >&2; exit 1; }
     echo "$OSD"
 ')
