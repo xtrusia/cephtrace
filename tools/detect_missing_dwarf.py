@@ -92,7 +92,7 @@ def version_key(v: str) -> tuple[int, ...]:
 
 
 def main() -> None:
-    """Probe upstream, diff against shipped JSONs, print missing rows as TSV."""
+    """Probe upstream, diff against shipped JSONs, print missing TSV rows."""
     upstream = upstream_el9_versions()
     if not upstream:
         # Treat a fully-empty probe set as a hard error: it almost always
