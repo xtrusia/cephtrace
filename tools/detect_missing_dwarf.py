@@ -51,7 +51,7 @@ def head(url: str, *, timeout: float = 15.0) -> int:
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status
-    except Exception:
+    except OSError:
         return 0
 
 
@@ -87,10 +87,12 @@ def existing_versions(tool: str) -> set[str]:
 
 
 def version_key(v: str) -> tuple[int, ...]:
+    """Sort key turning a dotted version string into an int tuple."""
     return tuple(int(x) for x in v.split("."))
 
 
 def main() -> None:
+    """Probe upstream, diff against shipped JSONs, print missing rows as TSV."""
     upstream = upstream_el9_versions()
     if not upstream:
         # Treat a fully-empty probe set as a hard error: it almost always
