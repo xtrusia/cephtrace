@@ -882,6 +882,11 @@ struct OsdProcessInfo {
   // annotate_traceability() for the --list path only: "yes", "no", "unknown"
   // (empty until computed).
   std::string traceable;
+  // Ceph package version, populated alongside `traceable` by
+  // annotate_traceability() for the --list path only.  Authoritative when
+  // traceable=="yes" (taken from the matched embedded entry); best-effort host
+  // package query for a non-container, non-traceable OSD; "unknown" otherwise.
+  std::string version;
 };
 
 std::string get_mnt_ns(int pid) {
@@ -936,7 +941,7 @@ std::vector<OsdProcessInfo> discover_ceph_osd_processes() {
             is_container = true;
           }
           
-          results.push_back({pid, osd_id, exe_path, is_container, ""});
+          results.push_back({pid, osd_id, exe_path, is_container, "", ""});
         }
       }
     }
@@ -957,8 +962,8 @@ std::vector<OsdProcessInfo> discover_ceph_osd_processes() {
 void print_discovered_osds(const std::vector<OsdProcessInfo>& processes,
                            bool show_traceable = false) {
   if (show_traceable) {
-    printf("  %-10s %-10s %-12s %-11s %-50s\n", "PID", "OSD ID", "Container", "Traceable", "Executable Path");
-    printf("  --------------------------------------------------------------------------------------------\n");
+    printf("  %-10s %-10s %-12s %-11s %-24s\n", "PID", "OSD ID", "Container", "Traceable", "Ceph Version");
+    printf("  -----------------------------------------------------------------------\n");
   } else {
     printf("  %-10s %-10s %-12s %-50s\n", "PID", "OSD ID", "Container", "Executable Path");
     printf("  --------------------------------------------------------------------------------\n");
@@ -968,8 +973,9 @@ void print_discovered_osds(const std::vector<OsdProcessInfo>& processes,
     std::string container_str = proc.is_container ? "yes" : "no";
     if (show_traceable) {
       std::string traceable_str = proc.traceable.empty() ? "unknown" : proc.traceable;
-      printf("  %-10d %-10s %-12s %-11s %-50s\n", proc.pid, osd_id_str.c_str(),
-             container_str.c_str(), traceable_str.c_str(), proc.exe_path.c_str());
+      std::string version_str = proc.version.empty() ? "unknown" : proc.version;
+      printf("  %-10d %-10s %-12s %-11s %-24s\n", proc.pid, osd_id_str.c_str(),
+             container_str.c_str(), traceable_str.c_str(), version_str.c_str());
     } else {
       printf("  %-10d %-10s %-12s %-50s\n", proc.pid, osd_id_str.c_str(), container_str.c_str(), proc.exe_path.c_str());
     }
@@ -983,14 +989,31 @@ void print_discovered_osds(const std::vector<OsdProcessInfo>& processes,
 // (or a container's) binary requires root; otherwise the verdict is "unknown".
 void annotate_traceability(std::vector<OsdProcessInfo>& processes) {
   for (auto& proc : processes) {
+    proc.version = "unknown";
     std::string bridged_path = "/proc/" + std::to_string(proc.pid) + "/root" + proc.exe_path;
     std::string build_id = get_elf_build_id(bridged_path);
     if (build_id.empty()) {
       proc.traceable = "unknown";
       continue;
     }
-    proc.traceable = DwarfParser::is_embedded_traceable(
-        {{get_basename(proc.exe_path), build_id}}, "osdtrace") ? "yes" : "no";
+    std::string matched;
+    bool ok = DwarfParser::is_embedded_traceable(
+        {{get_basename(proc.exe_path), build_id}}, "osdtrace", &matched);
+    proc.traceable = ok ? "yes" : "no";
+    if (ok) {
+      // Authoritative: the matched embedded entry's version is exactly the
+      // package this binary was built from.
+      if (!matched.empty()) proc.version = matched;
+    } else if (!proc.is_container &&
+               !check_executable_deleted(proc.pid, "ceph-osd")) {
+      // Best-effort for a native (non-container) OSD whose running binary still
+      // matches what's on disk: query the host package DB.  We skip containers
+      // (host DB describes the host, not the container) and skip processes
+      // whose on-disk binary was replaced after launch (the deleted-exe check),
+      // since the package DB would then report a version we aren't running.
+      std::string pkg = get_package_version(proc.exe_path);
+      if (!pkg.empty() && pkg != "unknown") proc.version = pkg;
+    }
   }
 }
 
@@ -1280,6 +1303,11 @@ int main(int argc, char **argv) {
           std::cout << "  'unknown': could not read the OSD binary's build-id; re-run as root" << std::endl;
           std::cout << "             (required for containerized OSDs)." << std::endl;
         }
+        std::cout << std::endl
+                  << "Ceph Version: authoritative when Traceable='yes' (the matched embedded entry)." << std::endl;
+        std::cout << "             For Traceable='no' it is a best-effort host package lookup, shown only" << std::endl;
+        std::cout << "             for native OSDs whose on-disk binary still matches the running process;" << std::endl;
+        std::cout << "             'unknown' for containerized OSDs or binaries upgraded since launch." << std::endl;
       }
     }
     return 0;
