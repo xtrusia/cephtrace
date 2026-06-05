@@ -119,7 +119,16 @@ fi
 
 ############################################################################
 info "=== Step 2: install cephadm + resolve image for $CEPH_RELEASE ==="
-CEPH_IMG=$(cephadm_image_for_release "$CEPH_RELEASE")
+# CEPH_IMAGE lets a caller pin an exact point-release image
+# (e.g. quay.io/ceph/ceph:v19.2.2) instead of the per-major "latest"
+# default.  The embedded-DWARF refresh bot uses this to run the verification
+# against the precise version it just generated a JSON for, so the build_id
+# matches and the embedded path actually engages.
+if [ -n "${CEPH_IMAGE:-}" ]; then
+    CEPH_IMG="$CEPH_IMAGE"
+else
+    CEPH_IMG=$(cephadm_image_for_release "$CEPH_RELEASE")
+fi
 info "image: $CEPH_IMG"
 install_cephadm "$CEPH_RELEASE" /tmp/cephadm "$CEPH_IMG"
 
@@ -289,6 +298,40 @@ wait
 # trace window).
 kill "$WL_PUT" "$WL_GET" 2>/dev/null || true
 sleep 2
+
+
+############################################################################
+info "=== Step 13b: check embedded-DWARF boot marker ==="
+# When REQUIRE_EMBEDDED=1 (the refresh bot's per-version verification), the
+# whole point is to prove the *embedded* JSON works: a fallback to live DWARF
+# parsing means the embedded data was never exercised, so treat it as a hard
+# failure.  Without the flag (the normal PR matrix) the marker is advisory --
+# the major-release "latest" image may legitimately predate or postdate the
+# embedded data, and live-parse fallback is an acceptable optimisation miss.
+check_embedded_marker() {
+    local tool="$1" log="$2"
+    if grep -q "Using embedded DWARF data" "$log"; then
+        info "✓ $tool used embedded DWARF data"
+        return 0
+    fi
+    if [ "${REQUIRE_EMBEDDED:-0}" = "1" ]; then
+        err "$tool did NOT use embedded DWARF data (REQUIRE_EMBEDDED=1)"
+        if grep -q "Start to parse dwarf info" "$log"; then
+            err "  -> it fell back to live DWARF parsing; the embedded JSON for this version was not matched (build_id mismatch?)"
+        else
+            err "  -> neither embedded nor live-parse marker present; tool may have failed to start"
+        fi
+        return 1
+    fi
+    if grep -q "Start to parse dwarf info" "$log"; then
+        info "[NOTE] $tool fell back to live DWARF parsing (embedded data not matched in this env)"
+    else
+        info "[NOTE] $tool: no embedded/live-parse marker found"
+    fi
+    return 0
+}
+check_embedded_marker osdtrace   "$OSDTRACE_LOG"
+check_embedded_marker radostrace "$RADOSTRACE_LOG"
 
 
 ############################################################################
