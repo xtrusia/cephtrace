@@ -8,7 +8,7 @@ already present under files/centos-stream/{osdtrace,radostrace}/.
 Output (one row per (version, missing-tool-list)) is TSV on stdout so the
 companion shell driver can read it line-by-line:
 
-  centos-stream  osdtrace,radostrace  17.2.4   2:17.2.4-0.el9   https://download.ceph.com/rpm-17.2.4/el9/x86_64/ceph-osd-17.2.4-0.el9.x86_64.rpm
+  centos-stream  osdtrace,radostrace  17.2.4  2:17.2.4-0.el9  <rpm-url>
 
 The columns are: distro, comma-joined-tool-list, upstream-version,
 package-version-string (matches what `osdtrace -j` records as the JSON's
