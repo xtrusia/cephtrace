@@ -872,6 +872,7 @@ bool export_json = false;
 bool skip_version_check = false;
 bool list_only = false;
 bool list_embedded = false;
+bool trace_all = false;
 
 struct OsdProcessInfo {
   int pid;
@@ -887,6 +888,11 @@ struct OsdProcessInfo {
   // traceable=="yes" (taken from the matched embedded entry); best-effort host
   // package query for a non-container, non-traceable OSD; "unknown" otherwise.
   std::string version;
+  // ELF build-id of the binary the uprobes would attach to (read through
+  // /proc/<pid>/root so containers resolve to the in-container binary).
+  // Populated by annotate_traceability(); used by -a to group processes that
+  // share a single build, since the BPF probe offsets are version-specific.
+  std::string build_id;
 };
 
 std::string get_mnt_ns(int pid) {
@@ -941,7 +947,7 @@ std::vector<OsdProcessInfo> discover_ceph_osd_processes() {
             is_container = true;
           }
           
-          results.push_back({pid, osd_id, exe_path, is_container, "", ""});
+          results.push_back({pid, osd_id, exe_path, is_container, "", "", ""});
         }
       }
     }
@@ -992,6 +998,7 @@ void annotate_traceability(std::vector<OsdProcessInfo>& processes) {
     proc.version = "unknown";
     std::string bridged_path = "/proc/" + std::to_string(proc.pid) + "/root" + proc.exe_path;
     std::string build_id = get_elf_build_id(bridged_path);
+    proc.build_id = build_id;
     if (build_id.empty()) {
       proc.traceable = "unknown";
       continue;
@@ -1026,6 +1033,7 @@ int parse_args(int argc, char **argv) {
     {"list", no_argument, 0, 0},
     {"list-embedded", no_argument, 0, 0},
     {"id", required_argument, 0, 0},
+    {"all", no_argument, 0, 'a'},
     {0, 0, 0, 0}
   };
 
@@ -1034,7 +1042,7 @@ int parse_args(int argc, char **argv) {
   // it in a plain char is unsafe on platforms where char is unsigned by
   // default (the `!= -1` test can then loop forever).  Match kfstrace.
   int opt;
-  while ((opt = getopt_long(argc, argv, ":st:bj:i:l:p:V", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, ":st:bj:i:l:p:Va", long_options, &option_index)) != -1) {
     switch (opt) {
       case 0:
         // Handle long options
@@ -1066,6 +1074,9 @@ int parse_args(int argc, char **argv) {
         print_tool_version("osdtrace");
         exit(0);
 
+      case 'a':
+        trace_all = true;
+        break;
       case 's':
         probe_mode &= ~OP_FULL_PROBE;
         probe_mode |= OP_SINGLE_PROBE;
@@ -1111,13 +1122,14 @@ int parse_args(int argc, char **argv) {
         break;
       case '?':
       case 'h':
-        std::cout << "Usage: " << argv[0] << " [-s] [-l <milliseconds>] [-b] [-j] [-i <filename>] [-t <seconds>] [-p <pid1,pid2,...>] [--id <osd-id1,osd-id2,...>] [--skip-version-check] [--list] [--list-embedded]\n";
+        std::cout << "Usage: " << argv[0] << " [-s] [-l <milliseconds>] [-b] [-j] [-i <filename>] [-t <seconds>] [-a] [-p <pid1,pid2,...>] [--id <osd-id1,osd-id2,...>] [--skip-version-check] [--list] [--list-embedded]\n";
         std::cout << "  -s                        Set probe mode to Single OP (logs PrimaryLogPG::log_op_stats only)\n";
         std::cout << "  -l <milliseconds>         Set operation latency threshold to capture\n";
         std::cout << "  -b                        Set probe mode to Bluestore\n";
         std::cout << "  -j                        Export DWARF info to JSON file\n";
         std::cout << "  -i <filename>             Import DWARF info from JSON file\n";
         std::cout << "  -t <seconds>              Set execution timeout in seconds\n";
+        std::cout << "  -a, --all                 Trace ALL traceable ceph-osd processes on the host (native and containerized)\n";
         std::cout << "  -p <pid1,pid2,...>        Probe using Process IDs (comma-separated, mandatory for tracing containerized processes)\n";
         std::cout << "  --id <osd-id1,osd-id2,...> Probe by OSD ID (comma-separated; resolves to PIDs via discovery)\n";
         std::cout << "  --skip-version-check      Skip version check when importing DWARF JSON (currently needed for containers)\n";
@@ -1311,6 +1323,84 @@ int main(int argc, char **argv) {
       }
     }
     return 0;
+  }
+
+  // -a / --all: trace every traceable ceph-osd process on the host (native and
+  // containerized).  Discover all OSDs, keep the ones this binary has matching
+  // embedded DWARF for, and feed their PIDs into the normal multi-PID flow.
+  //
+  // The BPF probe offsets are version-specific (one hprobes map, one set of
+  // function addresses per run), so -a assumes every traceable OSD shares a
+  // single build.  If the traceable OSDs span more than one build-id we can't
+  // trace them correctly in one run, so give up and ask the user to select a
+  // single-build subset with -p/--id.
+  if (trace_all) {
+    if (!process_ids.empty() || !requested_osd_ids.empty()) {
+      std::cerr << "Error: -a/--all cannot be combined with -p or --id" << std::endl;
+      return 1;
+    }
+    if (export_json || import_json) {
+      std::cerr << "Error: -a/--all cannot be combined with -j or -i" << std::endl;
+      return 1;
+    }
+    if (geteuid() != 0) {
+      std::cerr << "Warning: not running as root; containerized OSDs (and OSDs"
+                << " owned by other users) may be missed or show as untraceable." << std::endl;
+    }
+
+    auto processes = discover_ceph_osd_processes();
+    if (processes.empty()) {
+      std::cerr << "No active ceph-osd processes detected on the host." << std::endl;
+      return 1;
+    }
+    annotate_traceability(processes);
+
+    std::vector<OsdProcessInfo> traceable, not_traceable;
+    for (const auto& p : processes) {
+      if (p.traceable == "yes" && !p.build_id.empty())
+        traceable.push_back(p);
+      else
+        not_traceable.push_back(p);
+    }
+
+    if (traceable.empty()) {
+      std::cerr << "Error: none of the " << processes.size()
+                << " ceph-osd process(es) are traceable with this osdtrace's"
+                << " embedded DWARF data." << std::endl;
+      print_discovered_osds(processes, /*show_traceable=*/true);
+      std::cerr << std::endl
+                << "Export a DWARF JSON on a host with the matching ceph-osd"
+                << " (osdtrace -j <file>), then trace with -p <pid> -i <file>"
+                << " --skip-version-check." << std::endl;
+      return 1;
+    }
+
+    // -a assumes a single build across all traceable OSDs; bail out otherwise.
+    const std::string& build_id = traceable.front().build_id;
+    for (const auto& p : traceable) {
+      if (p.build_id != build_id) {
+        std::cerr << "Error: traceable ceph-osd processes span more than one"
+                  << " build; -a cannot trace multiple builds in one run."
+                  << std::endl;
+        print_discovered_osds(traceable, /*show_traceable=*/true);
+        std::cerr << std::endl
+                  << "Trace a single-build subset explicitly with -p <pid,...>"
+                  << " or --id <osd-id,...>." << std::endl;
+        return 1;
+      }
+    }
+
+    for (const auto& p : traceable) process_ids.insert(p.pid);
+
+    std::cout << "Tracing " << process_ids.size()
+              << " ceph-osd process(es) selected by -a:" << std::endl;
+    print_discovered_osds(traceable, /*show_traceable=*/true);
+    if (!not_traceable.empty()) {
+      std::cout << std::endl << "Skipping " << not_traceable.size()
+                << " non-traceable ceph-osd process(es):" << std::endl;
+      print_discovered_osds(not_traceable, /*show_traceable=*/true);
+    }
+    std::cout << std::endl;
   }
 
   // Resolve --id <osd-id,...> to PIDs via discovery and feed into process_ids.
