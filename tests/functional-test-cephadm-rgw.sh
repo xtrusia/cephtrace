@@ -144,7 +144,7 @@ info "OSD devices: ${OSD_DEVS[*]}"
 info "=== Step 4: bootstrap single-host cephadm cluster ==="
 MON_IP=$(hostname -I | awk '{print $1}')
 info "MON_IP=$MON_IP"
-FSID=$(cephadm_bootstrap_single_host "$CEPH_IMG" "$MON_IP" /tmp/cephadm)
+FSID=$(cephadm_bootstrap_single_host "$CEPH_IMG" "$MON_IP" /tmp/cephadm) || true
 [ -n "$FSID" ] || { err "bootstrap failed to produce FSID"; exit 1; }
 info "FSID=$FSID"
 
