@@ -128,34 +128,31 @@ jobs:
             make clean
             make -j"$(nproc)" osdtrace radostrace
 
-      - name: Stage generated JSONs + manifest for downstream jobs
+      - name: Bundle generated JSONs + manifest for downstream jobs
         if: steps.generate.outputs.succeeded != '0'
         run: |
-            mkdir -p /tmp/artifacts/jsons/osdtrace /tmp/artifacts/jsons/radostrace
+            # The JSON filenames embed the package epoch (e.g.
+            # osd-2:19.2.2-0.el9_dwarf.json) and actions/upload-artifact@v4
+            # rejects the ':' character outright, so ship a colon-free tarball
+            # (plus the colon-free manifest TSVs) rather than the raw files.
+            mkdir -p /tmp/artifacts
+            : > /tmp/artifacts/filelist.txt
             while IFS=$'\t' read -r distro tools version pkgver; do
                 for f in "files/centos-stream/osdtrace/osd-${pkgver}_dwarf.json" \
                          "files/centos-stream/radostrace/rados-${pkgver}_dwarf.json"; do
-                    [ -f "$f" ] && cp "$f" "/tmp/artifacts/jsons/${f#files/centos-stream/}"
+                    [ -f "$f" ] && echo "$f" >> /tmp/artifacts/filelist.txt
                 done
             done < /tmp/succeeded.tsv
-            mkdir -p /tmp/artifacts/manifest
-            cp /tmp/succeeded.tsv /tmp/failed.tsv /tmp/missing.tsv /tmp/artifacts/manifest/ 2>/dev/null || true
-            find /tmp/artifacts -type f | sort
+            tar -czf /tmp/artifacts/generated-jsons.tar.gz -T /tmp/artifacts/filelist.txt
+            cp /tmp/succeeded.tsv /tmp/failed.tsv /tmp/missing.tsv /tmp/artifacts/ 2>/dev/null || true
+            echo "=== tarball contents ==="; tar -tzf /tmp/artifacts/generated-jsons.tar.gz
 
-      - name: Upload generated JSONs
+      - name: Upload generated JSONs + manifest
         if: steps.generate.outputs.succeeded != '0'
         uses: actions/upload-artifact@v4
         with:
           name: generated-jsons
-          path: /tmp/artifacts/jsons/
-          retention-days: 7
-
-      - name: Upload generation manifest
-        if: steps.generate.outputs.succeeded != '0'
-        uses: actions/upload-artifact@v4
-        with:
-          name: gen-manifest
-          path: /tmp/artifacts/manifest/
+          path: /tmp/artifacts/
           retention-days: 7
 
   verify:
@@ -184,7 +181,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: generated-jsons
-          path: files/centos-stream
+          path: /tmp/gen
+
+      - name: Unpack generated JSONs into the tree
+        run: tar -xzf /tmp/gen/generated-jsons.tar.gz
 
       - name: Build osdtrace + radostrace with the new JSONs embedded
         # Rebuilding here (rather than shipping a binary artifact) guarantees
@@ -251,17 +251,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download generated JSONs
+      - name: Download generated JSONs + manifest
         uses: actions/download-artifact@v4
         with:
           name: generated-jsons
-          path: /tmp/gen-jsons
+          path: /tmp/gen
 
-      - name: Download generation manifest
-        uses: actions/download-artifact@v4
-        with:
-          name: gen-manifest
-          path: /tmp/manifest
+      - name: Unpack generated JSONs
+        run: |
+            mkdir -p /tmp/gen-extract
+            tar -xzf /tmp/gen/generated-jsons.tar.gz -C /tmp/gen-extract
 
       - name: Download verification results
         uses: actions/download-artifact@v4
@@ -285,14 +284,14 @@ jobs:
             : > /tmp/verified.tsv
             : > /tmp/verifyfailed.tsv
             copied=0
-            if [ -f /tmp/manifest/succeeded.tsv ]; then
+            if [ -f /tmp/gen/succeeded.tsv ]; then
                 while IFS=$'\t' read -r distro tools version pkgver; do
                     [ -n "$version" ] || continue
                     st="${status[$version]:-missing}"
                     if [ "$st" = "success" ]; then
                         for pair in "osdtrace/osd-${pkgver}_dwarf.json" \
                                     "radostrace/rados-${pkgver}_dwarf.json"; do
-                            src="/tmp/gen-jsons/${pair}"
+                            src="/tmp/gen-extract/files/centos-stream/${pair}"
                             dst="files/centos-stream/${pair}"
                             if [ -f "$src" ]; then
                                 mkdir -p "$(dirname "$dst")"
@@ -307,7 +306,7 @@ jobs:
                             >> /tmp/verifyfailed.tsv
                         echo "::warning::runtime verification failed for $version (status=$st); dropping from PR"
                     fi
-                done < /tmp/manifest/succeeded.tsv
+                done < /tmp/gen/succeeded.tsv
             fi
             echo "copied=$copied" >> "$GITHUB_OUTPUT"
             echo "Copied $copied verified JSON file(s) into the working tree."
@@ -336,13 +335,13 @@ jobs:
                     echo '```'
                     echo
                 fi
-                if [ -s /tmp/manifest/failed.tsv ]; then
+                if [ -s /tmp/gen/failed.tsv ]; then
                     echo "## Versions that failed to generate"
                     echo
                     echo "These will be retried by the next scheduled run."
                     echo
                     echo '```'
-                    cat /tmp/manifest/failed.tsv
+                    cat /tmp/gen/failed.tsv
                     echo '```'
                     echo
                 fi
