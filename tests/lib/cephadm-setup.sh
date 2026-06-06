@@ -129,10 +129,27 @@ _purge_partial_clusters() {
     local cephadm_bin="${1:-cephadm}"
     local fsid
     for fsid in $(ls /var/lib/ceph/ 2>/dev/null | grep -E '^[0-9a-f]{8}-[0-9a-f-]+$'); do
-        info "purging leftover cluster $fsid before bootstrap"
+        # NOTE: info() prints to stdout; this helper runs inside the
+        # FSID=$(cephadm_bootstrap_single_host ...) capture, so route every
+        # progress line to stderr or it pollutes the captured FSID.
+        info "purging leftover cluster $fsid before bootstrap" >&2
         "$cephadm_bin" rm-cluster --fsid "$fsid" --force --zap-osds >&2 2>/dev/null || true
         rm -rf "/var/lib/ceph/$fsid" 2>/dev/null || true
     done
+}
+
+
+# _orch_backend_ready <fsid>
+#
+# True iff the orchestrator backend is live in the freshly bootstrapped
+# cluster — i.e. `ceph orch status` works.  This is the property that
+# actually matters: the test next runs `ceph orch apply` for OSDs/RGW, which
+# needs a working cephadm backend.  We check this rather than the bootstrap
+# exit code because that code conflates two very different outcomes (see
+# cephadm_bootstrap_single_host).
+_orch_backend_ready() {
+    local fsid="$1"
+    cephadm shell --fsid "$fsid" -- ceph orch status >/dev/null 2>&1
 }
 
 
@@ -143,17 +160,28 @@ _purge_partial_clusters() {
 # a real network range; --allow-overwrite lets the test be idempotent
 # across retries on the same runner.
 #
-# Bootstrap is retried up to CEPHADM_BOOTSTRAP_ATTEMPTS times (default 3).
-# `cephadm bootstrap` has a known transient race near the end: it restarts
-# the mgr to load the cephadm module, then immediately runs
-# `orch set backend cephadm`.  If the orchestrator module has not finished
-# loading yet, that command fails with
-#   Error ENOTSUP ... Module 'orchestrator' is not enabled/loaded
-# and the whole bootstrap aborts.  It is not resumable, so the robust
-# response is to purge the half-built cluster and bootstrap again from
-# scratch.  Returns non-zero (echoing nothing) if every attempt fails, so
-# the caller fails fast instead of proceeding against a backend-less cluster
-# and timing out later while waiting for OSDs that can never be scheduled.
+# Bootstrap is retried up to CEPHADM_BOOTSTRAP_ATTEMPTS times (default 3),
+# and success is judged by the cluster's actual state, NOT by the bootstrap
+# exit code.  That distinction matters because the exit code conflates two
+# opposite outcomes:
+#
+#   * Transient, fatal (must retry): a race near the end of bootstrap — the
+#     mgr restarts to load the cephadm module, then `orch set backend
+#     cephadm` runs before the orchestrator module finishes loading and
+#     fails with `Error ENOTSUP ... Module 'orchestrator' is not
+#     enabled/loaded`.  The whole bootstrap aborts and leaves no working
+#     backend.  Seen on tentacle (v20.2.x).
+#   * Benign, non-fatal (must accept): bootstrapping an older image (quincy,
+#     reef) with a newer host cephadm tries to deploy services the image
+#     does not know — e.g. `orch apply ceph-exporter` fails with EINVAL on
+#     quincy.  cephadm logs it, prints "Bootstrap complete.", and leaves a
+#     fully functional cluster, yet still exits non-zero.
+#
+# So after each attempt we keep the cluster only if its orchestrator backend
+# is actually live (_orch_backend_ready); otherwise we purge it and retry.
+# Returns non-zero (echoing nothing) if every attempt fails, so the caller
+# fails fast instead of proceeding against a backend-less cluster and timing
+# out later while waiting for OSDs that can never be scheduled.
 cephadm_bootstrap_single_host() {
     local image="$1"; local mon_ip="$2"; local cephadm_bin="${3:-/tmp/cephadm}"
     local max_attempts="${CEPHADM_BOOTSTRAP_ATTEMPTS:-3}"
@@ -171,7 +199,7 @@ cephadm_bootstrap_single_host() {
     # it was added later in the quincy line and the apt-installed cephadm
     # on Ubuntu 22.04 rejects it.  CI doesn't need the inspection anyway —
     # we purge partial clusters ourselves between attempts (see below).
-    local attempt rc
+    local attempt rc fsid
     for (( attempt=1; attempt<=max_attempts; attempt++ )); do
         # Always start from a clean slate: clears any debris left by a
         # previous failed attempt (or a stale cluster from an earlier run on
@@ -189,14 +217,21 @@ cephadm_bootstrap_single_host() {
             --allow-mismatched-release \
             >&2 || rc=$?
 
-        if [[ $rc -eq 0 ]]; then
-            ls /var/lib/ceph/ 2>/dev/null | grep -E '^[0-9a-f]{8}-[0-9a-f-]+$' | head -1
+        fsid=$(ls /var/lib/ceph/ 2>/dev/null | grep -E '^[0-9a-f]{8}-[0-9a-f-]+$' | head -1)
+        if [[ -n "$fsid" ]] && _orch_backend_ready "$fsid"; then
+            # Cluster is up with a working orchestrator backend; a non-zero
+            # rc here is the benign service-apply mismatch described above.
+            # info() goes to stdout, which this function's caller captures as
+            # the FSID — keep all progress on stderr and emit ONLY the bare
+            # FSID on stdout.
+            [[ $rc -eq 0 ]] || info "bootstrap exited rc=$rc but orchestrator backend is live — accepting cluster $fsid" >&2
+            echo "$fsid"
             return 0
         fi
 
-        err "cephadm bootstrap attempt ${attempt}/${max_attempts} failed (rc=$rc)"
+        err "cephadm bootstrap attempt ${attempt}/${max_attempts} failed (rc=$rc, orchestrator backend not ready)"
         if (( attempt < max_attempts )); then
-            info "retrying bootstrap in ${retry_delay}s ..."
+            info "retrying bootstrap in ${retry_delay}s ..." >&2
             sleep "$retry_delay"
         fi
     done
