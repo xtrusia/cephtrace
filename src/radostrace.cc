@@ -676,22 +676,20 @@ int main(int argc, char **argv) {
       // When -j is used to export JSON, force live parsing so the output reflects
       // the installed binary (not a re-dump of the embedded data the header came
       // from). Otherwise try embedded DWARF data first, keyed by the on-disk
-      // ELF build-id of each library.
+      // ELF build-id of libceph-common.so.2.  That single build-id pins the
+      // exact package build (all three libs ship from it), so the matcher
+      // selects the right entry and loads whatever modules it carries.
       //
       // The library paths are reported as they appear inside the target's
       // mount namespace; for containerized rbd clients (podman / docker)
-      // those paths don't exist on the host.  Read the build-ids through
+      // those paths don't exist on the host.  Read the build-id through
       // /proc/<pid>/root/ when a target PID is specified so the read sees
-      // the same files the uprobe will attach to.
+      // the same file the uprobe will attach to.
       auto bid_path = [process_id](const std::string& p) -> std::string {
           if (process_id == -1) return p;
           return "/proc/" + std::to_string(process_id) + "/root" + p;
       };
       std::vector<std::pair<std::string, std::string>> rados_mods = {
-          {get_basename(librbd_path),
-              get_elf_build_id(bid_path(librbd_path))},
-          {get_basename(librados_path),
-              get_elf_build_id(bid_path(librados_path))},
           {get_basename(libceph_common_path),
               get_elf_build_id(bid_path(libceph_common_path))},
       };

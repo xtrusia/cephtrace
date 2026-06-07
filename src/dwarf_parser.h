@@ -104,17 +104,19 @@ class DwarfParser {
    * Imports module function data from compiled-in embedded DWARF data,
    * matching the target binary by ELF GNU build-id.
    *
-   * An embedded entry matches iff the set of (module basename, build-id)
-   * pairs the caller supplies equals the entry's `modules[]` set exactly
-   * (same size, same content).  Any empty build-id on either side
-   * prevents that entry from matching — legacy JSONs without build-id
-   * data are therefore never selected by this path.
+   * An embedded entry matches iff every (module basename, build-id) pair the
+   * caller supplies is present in the entry's `modules[]` — i.e. the caller's
+   * set is a subset of the entry's.  The entry may carry extra modules, which
+   * import_from_embedded loads as well.  An empty caller-side build-id, or an
+   * empty build-id on the embedded module, prevents a match — legacy JSONs
+   * without build-id data are therefore never selected by this path.
    *
    * @param modules            Vector of (basename, hex-encoded build-id)
-   *                           pairs identifying the target binaries.
+   *                           pairs identifying the target build.  A single
+   *                           identifying library suffices since its build-id
+   *                           pins the package build.
    *                           For osdtrace: {{"ceph-osd", <hex>}}.
-   *                           For radostrace: three entries (librbd.so.1,
-   *                           librados.so.2, libceph-common.so.2).
+   *                           For radostrace: {{"libceph-common.so.2", <hex>}}.
    * @param trace_type         "osdtrace" or "radostrace".
    * @param matched_version_out If non-null, set to the matched entry's
    *                           version string on success (used by
