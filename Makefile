@@ -147,21 +147,58 @@ $(BPFTOOL): | $(BPFTOOL_OUTPUT)
 	$(call msg,BPFTOOL,$@)
 	$(Q)make ARCH= CROSS_COMPILE= OUTPUT=$(BPFTOOL_OUTPUT)/ -C $(BPFTOOL_SRC) bootstrap
 
+
 # Generate Ceph BTF header
 $(OSDTRACE_SRC)/ceph_btf_local.h: | $(OUTPUT) $(BPFTOOL)
 	@$(call msg,GEN-BTF,$@)
 	@set -eu; \
-	src=""; tmp=""; \
-	CEPH_KO=$$(find /lib/modules/$$(uname -r) -type f -name 'ceph.ko*' 2>/dev/null | head -1); \
-	[ -n "$$CEPH_KO" ] || { echo "No ceph.ko* found under /lib/modules/$$(uname -r)" >&2; exit 1; }; \
+	src=""; tmp=""; kver=""; kdir=""; base_btf=""; \
+	kver=$$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -V | tail -1); \
+	[ -n "$$kver" ] || { echo "No installed kernels found under /lib/modules" >&2; exit 1; }; \
+	kdir="/lib/modules/$$kver"; \
+	CEPH_KO=$$(find "$$kdir" -type f -name 'ceph.ko*' 2>/dev/null | head -1); \
+	[ -n "$$CEPH_KO" ] || { echo "No ceph.ko* found under $$kdir" >&2; exit 1; }; \
+	\
+	for cand in \
+		"$$kdir/vmlinux" \
+		"/usr/lib/debug/lib/modules/$$kver/vmlinux" \
+		"/usr/lib/debug/boot/vmlinux-$$kver" \
+		"/boot/vmlinux-$$kver"; do \
+		if [ -r "$$cand" ]; then \
+			base_btf="$$cand"; \
+			break; \
+		fi; \
+	done; \
+	if [ -z "$$base_btf" ] && [ "$$kver" = "$$(uname -r)" ] && [ -r /sys/kernel/btf/vmlinux ]; then \
+		base_btf="/sys/kernel/btf/vmlinux"; \
+	fi; \
+	\
+	[ -n "$$base_btf" ] || { \
+		echo "No usable vmlinux/base BTF found for installed kernel $$kver" >&2; \
+		echo "Need one of:" >&2; \
+		echo "  $$kdir/vmlinux" >&2; \
+		echo "  /usr/lib/debug/lib/modules/$$kver/vmlinux" >&2; \
+		echo "  /usr/lib/debug/boot/vmlinux-$$kver" >&2; \
+		echo "  /boot/vmlinux-$$kver" >&2; \
+		exit 1; \
+	}; \
+	\
+	echo "Using installed kernel: $$kver"; \
 	echo "Found ceph kernel module: $$CEPH_KO"; \
+	echo "Using base BTF source: $$base_btf"; \
+	\
 	case "$$CEPH_KO" in \
 		*.ko)     src="$$CEPH_KO";; \
-		*.ko.xz)  tmp=$$(mktemp); xz -v -dc "$$CEPH_KO" >"$$tmp"; src="$$tmp";; \
-		*.ko.zst) tmp=$$(mktemp); zstd -v -dc --no-progress "$$CEPH_KO" >"$$tmp"; src="$$tmp";; \
+		*.ko.xz)  tmp=$$(mktemp); xz -dc "$$CEPH_KO" >"$$tmp"; src="$$tmp";; \
+		*.ko.zst) tmp=$$(mktemp); zstd -dc --no-progress "$$CEPH_KO" >"$$tmp"; src="$$tmp";; \
+		*) echo "Unsupported ceph module format: $$CEPH_KO" >&2; exit 1;; \
 	esac; \
-	$(BPFTOOL) btf dump file "$$src" format c --base-btf /sys/kernel/btf/vmlinux >"$@"; \
-	rm -fv $$tmp; \
+	\
+	$(BPFTOOL) btf dump file "$$src" format c --base-btf "$$base_btf" >"$@"; \
+	sed -E -i \
+            's/^([[:space:]]*typedef[[:space:]]+)__builtin_va_list___[0-9]+([[:space:]]+)/\1__builtin_va_list\2/' \
+            "$@"; \
+	rm -f "$$tmp"
 
 # Build BPF objects and skeletons
 $(OUTPUT)/kfstrace.bpf.o: $(OSDTRACE_SRC)/kfstrace.bpf.c $(OSDTRACE_SRC)/ceph_btf_local.h $(LIBBPF_OBJ) | $(OUTPUT) $(BPFTOOL)
