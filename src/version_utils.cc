@@ -267,42 +267,11 @@ static std::string find_library_path_from_maps(const std::string& lib_name, int 
     return "";
 }
 
-std::string find_library_path(const std::string& lib_name, int pid) {
-    // If a PID is specified, the process's maps are authoritative: a library
-    // that isn't mapped there can't be uprobed in that process anyway, so no
-    // filesystem fallback is attempted.
-    if (pid != -1) {
-        std::string result = find_library_path_from_maps(lib_name, pid);
-        if (result.empty()) {
-            std::cerr << "Could not find " << lib_name << " in /proc/" << pid
-                      << "/maps" << std::endl;
-        }
-        return result;
-    }
-
-    // No PID: find the library on the host.  First try dlopen.
-    void* handle = dlopen(lib_name.c_str(), RTLD_LAZY | RTLD_NOLOAD);
-    if (!handle) {
-        // If not loaded, try to load it
-        handle = dlopen(lib_name.c_str(), RTLD_LAZY);
-    }
-
-    if (handle) {
-        // Get the path using dlinfo
-        struct link_map* link_map;
-        if (dlinfo(handle, RTLD_DI_LINKMAP, &link_map) == 0 && link_map) {
-            std::string path = link_map->l_name;
-            dlclose(handle);
-            if (!path.empty() && path != lib_name) {
-                std::clog << "Found library " << lib_name << " at: " << path << std::endl;
-                return path;
-            }
-        } else {
-            dlclose(handle);
-        }
-    }
-
-    // Fallback: search in common library directories
+// Search the common library directories under root_prefix (empty for the
+// host, "/proc/<pid>/root" for a target process's mount namespace).  The
+// returned path excludes the prefix, i.e. it is namespace-relative.
+static std::string search_library_dirs(const std::string& lib_name,
+                                       const std::string& root_prefix) {
     std::vector<std::string> search_dirs = {
         "./lib",
         "/lib",
@@ -333,7 +302,7 @@ std::string find_library_path(const std::string& lib_name, int pid) {
     for (const auto& dir : search_dirs) {
         for (const auto& name : possible_names) {
             std::string full_path = dir + "/" + name;
-            if (access(full_path.c_str(), F_OK) == 0) {
+            if (access((root_prefix + full_path).c_str(), F_OK) == 0) {
                 std::clog << "Found library " << lib_name << " at: " << full_path << std::endl;
                 return full_path;
             }
@@ -341,6 +310,48 @@ std::string find_library_path(const std::string& lib_name, int pid) {
     }
 
     return "";
+}
+
+std::string find_library_path(const std::string& lib_name, int pid) {
+    // If a PID is specified, prefer the process's maps: they name the exact
+    // file it loaded.  Fall back to searching the common directories inside
+    // its mount namespace (via /proc/<pid>/root) for a library that is on
+    // the target's filesystem but not mapped — e.g. librbd.so.1 when the
+    // target is a radosgw; uprobes attach to the file, so that still works.
+    if (pid != -1) {
+        std::string result = find_library_path_from_maps(lib_name, pid);
+        if (!result.empty())
+            return result;
+        std::clog << "Could not find " << lib_name << " in /proc/" << pid
+                  << "/maps, searching its filesystem" << std::endl;
+        return search_library_dirs(
+            lib_name, "/proc/" + std::to_string(pid) + "/root");
+    }
+
+    // No PID: find the library on the host.  First try dlopen.
+    void* handle = dlopen(lib_name.c_str(), RTLD_LAZY | RTLD_NOLOAD);
+    if (!handle) {
+        // If not loaded, try to load it
+        handle = dlopen(lib_name.c_str(), RTLD_LAZY);
+    }
+
+    if (handle) {
+        // Get the path using dlinfo
+        struct link_map* link_map;
+        if (dlinfo(handle, RTLD_DI_LINKMAP, &link_map) == 0 && link_map) {
+            std::string path = link_map->l_name;
+            dlclose(handle);
+            if (!path.empty() && path != lib_name) {
+                std::clog << "Found library " << lib_name << " at: " << path << std::endl;
+                return path;
+            }
+        } else {
+            dlclose(handle);
+        }
+    }
+
+    // Fallback: search in common library directories
+    return search_library_dirs(lib_name, "");
 }
 
 std::string find_executable_path(const std::string& exe_name) {
