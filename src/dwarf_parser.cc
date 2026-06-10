@@ -1036,27 +1036,29 @@ static const EmbeddedVersion* find_embedded_match(
         return nullptr;
     }
 
-    // Linear scan: an entry matches iff every module it lists is present in
-    // `want` (subset semantics).  The caller always supplies one tuple per
-    // library it intends to probe; the embedded entry may legitimately
-    // cover only a strict subset of those — e.g. Ceph 20.2 moved the
-    // Objecter symbols out of librbd/librados into libceph-common, so the
-    // 20.2.x radostrace entry holds data only for libceph-common.so.2 even
-    // though the caller still passes (librbd, librados, libceph-common).
-    // The per-module build-id pins identity, so subset matching can't
-    // confuse two different package versions.  Any empty build-id in the
-    // embedded data disqualifies that entry (legacy JSONs predating the
-    // build-id scheme).
+    // Linear scan: an entry matches iff every module the caller asked for
+    // (`want`) is present in the entry with the same build-id, i.e. want is a
+    // subset of the entry's modules.  Callers pass a single identifying
+    // library — libceph-common.so.2 for radostrace, ceph-osd for osdtrace —
+    // whose build-id pins the exact package build; an entry may carry extra
+    // modules (e.g. pre-20.2 radostrace entries also hold librbd/librados,
+    // which import_from_embedded loads too) that the caller need not name.
+    // The per-module build-id pins identity, so this can't confuse two
+    // different package versions.  Any empty build-id in the embedded data is
+    // skipped, so legacy JSONs predating the build-id scheme never match.
     for (int i = 0; i < count; ++i) {
         const EmbeddedVersion& v = versions[i];
         if (v.num_modules == 0) continue;
 
-        bool all_match = true;
+        std::set<std::pair<std::string, std::string>> have;
         for (int m = 0; m < v.num_modules; ++m) {
             const char* bid = v.modules[m].build_id;
-            if (!bid || *bid == '\0') { all_match = false; break; }
-            auto it = want.find({v.modules[m].module_name, bid});
-            if (it == want.end()) { all_match = false; break; }
+            if (bid && *bid != '\0') have.emplace(v.modules[m].module_name, bid);
+        }
+
+        bool all_match = true;
+        for (const auto& w : want) {
+            if (have.find(w) == have.end()) { all_match = false; break; }
         }
         if (all_match) {
             return &v;

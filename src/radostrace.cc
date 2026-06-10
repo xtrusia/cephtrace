@@ -415,6 +415,93 @@ static int handle_event(void *ctx, void *data, size_t size) {
     return 0;
 }
 
+// One row of `--list` output: a client process that has libceph-common loaded.
+struct CephClientInfo {
+  int pid;
+  std::string exe_path;
+  bool is_container = false;
+  std::string traceable = "unknown";  // "yes" / "no" / "unknown"
+  std::string version = "unknown";    // authoritative only when traceable=="yes"
+};
+
+static std::string get_mnt_ns(int pid) {
+  char buf[256];
+  std::string p = "/proc/" + std::to_string(pid) + "/ns/mnt";
+  ssize_t n = readlink(p.c_str(), buf, sizeof(buf) - 1);
+  return n > 0 ? std::string(buf, n) : "";
+}
+
+// Discover client processes that have libceph-common loaded (i.e. the processes
+// radostrace can attach to) and annotate each with container status, embedded-
+// DWARF traceability, and Ceph version.  Mirrors osdtrace's --list.
+std::vector<CephClientInfo> discover_ceph_clients() {
+  std::vector<CephClientInfo> results;
+  DIR *proc_dir = opendir("/proc");
+  if (!proc_dir) {
+    std::cerr << "Error: Could not open /proc directory" << std::endl;
+    return results;
+  }
+  std::string self_ns = get_mnt_ns(getpid());
+
+  struct dirent *entry;
+  while ((entry = readdir(proc_dir)) != NULL) {
+    if (entry->d_type != DT_DIR || !isdigit(entry->d_name[0]))
+      continue;
+    int pid = atoi(entry->d_name);
+    if (pid <= 0)
+      continue;
+
+    // A process is a client iff it has libceph-common loaded; grab its path.
+    std::string lib_path;
+    std::ifstream maps("/proc/" + std::string(entry->d_name) + "/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+      size_t slash = line.find('/');
+      if (slash != std::string::npos &&
+          line.find("libceph-common.so.2", slash) != std::string::npos) {
+        lib_path = line.substr(slash);
+        break;
+      }
+    }
+    if (lib_path.empty())
+      continue;
+
+    CephClientInfo info;
+    info.pid = pid;
+    info.exe_path = get_exe_path_for_pid(pid);
+    std::string ns = get_mnt_ns(pid);
+    info.is_container = !self_ns.empty() && !ns.empty() && self_ns != ns;
+
+    // Read the build-id through /proc/<pid>/root so containerized clients
+    // resolve to the in-container library the uprobe would attach to.
+    std::string bid = get_elf_build_id(
+        "/proc/" + std::to_string(pid) + "/root" + lib_path);
+    std::string matched;
+    if (bid.empty()) {
+      info.traceable = "unknown";  // couldn't read the build-id (usually non-root)
+    } else if (DwarfParser::is_embedded_traceable(
+                   {{"libceph-common.so.2", bid}}, "radostrace", &matched)) {
+      info.traceable = "yes";
+      if (!matched.empty()) info.version = matched;
+    } else {
+      info.traceable = "no";
+      // Best-effort host package lookup for a native (non-container) client.
+      if (!info.is_container) {
+        std::string pkg = get_package_version(lib_path);
+        if (!pkg.empty() && pkg != "unknown") info.version = pkg;
+      }
+    }
+    results.push_back(info);
+  }
+  closedir(proc_dir);
+
+  std::sort(results.begin(), results.end(),
+            [](const CephClientInfo &a, const CephClientInfo &b) {
+              return a.pid < b.pid;
+            });
+  return results;
+}
+
 
 int main(int argc, char **argv) {
   signal(SIGINT, signal_handler); 
@@ -472,6 +559,29 @@ int main(int argc, char **argv) {
           }
       } else if (arg == "--skip-version-check") {
           skip_version_check = true;
+      } else if (arg == "--list") {
+          if (geteuid() != 0) {
+              std::cout << "Warning: not running as root; processes owned by other users may be missed,"
+                        << " and Traceable/Ceph Version may show as unknown." << std::endl << std::endl;
+          }
+          auto clients = discover_ceph_clients();
+          if (clients.empty()) {
+              std::cout << "No client processes using libceph-common detected on the host." << std::endl;
+          } else {
+              std::cout << "Detected " << clients.size() << " client process(es) using libceph-common:" << std::endl;
+              printf("  %-10s %-11s %-11s %-24s %s\n", "PID", "Container", "Traceable", "Ceph Version", "Executable Path");
+              printf("  --------------------------------------------------------------------------------\n");
+              for (const auto &c : clients) {
+                  printf("  %-10d %-11s %-11s %-24s %s\n", c.pid,
+                         c.is_container ? "yes" : "no", c.traceable.c_str(),
+                         c.version.c_str(), c.exe_path.empty() ? "unknown" : c.exe_path.c_str());
+              }
+              std::cout << std::endl
+                        << "Traceable: 'yes' means this radostrace has matching embedded DWARF data;"
+                        << " 'no' means it doesn't (export a DWARF JSON with -j on a matching host and"
+                        << " use -i); 'unknown' means a build-id couldn't be read (re-run as root)." << std::endl;
+          }
+          return 0;
       } else if (arg == "--list-embedded") {
           DwarfParser::list_embedded_versions("radostrace");
           return 0;
@@ -479,13 +589,14 @@ int main(int argc, char **argv) {
           print_tool_version("radostrace");
           return 0;
       } else if (arg == "-h" || arg == "--help") {
-          std::cout << "Usage: " << argv[0] << " [-t <timeout seconds>] [-j [filename]] [-i <filename>] [-o [filename]] [-p <pid>] [--skip-version-check] [--list-embedded]\n";
+          std::cout << "Usage: " << argv[0] << " [-t <timeout seconds>] [-j [filename]] [-i <filename>] [-o [filename]] [-p <pid>] [--skip-version-check] [--list] [--list-embedded]\n";
           std::cout << "  -t, --timeout <seconds>    Set execution timeout in seconds\n";
           std::cout << "  -j, --export-json <file>   Export DWARF info to JSON (default: radostrace_dwarf.json)\n";
           std::cout << "  -i, --import-json <file>   Import DWARF info from JSON file\n";
           std::cout << "  -o, --output <file>        Export events data info to CSV (default: radostrace_events.csv)\n";
           std::cout << "  -p, --pid <pid>            Attach uprobes only to the specified process ID (Mandatory for container based process tracing)\n";
           std::cout << "  --skip-version-check       Skip version check when importing DWARF JSON (currently needed for containers)\n";
+          std::cout << "  --list                     List client processes using libceph-common (PID, container, traceability, version), and exit\n";
           std::cout << "  --list-embedded            List the Ceph versions with DWARF data compiled into this binary, and exit\n";
           std::cout << "  -V, --version              Print version information and exit\n";
           std::cout << "  -h, --help                 Show this help message\n";
@@ -565,22 +676,20 @@ int main(int argc, char **argv) {
       // When -j is used to export JSON, force live parsing so the output reflects
       // the installed binary (not a re-dump of the embedded data the header came
       // from). Otherwise try embedded DWARF data first, keyed by the on-disk
-      // ELF build-id of each library.
+      // ELF build-id of libceph-common.so.2.  That single build-id pins the
+      // exact package build (all three libs ship from it), so the matcher
+      // selects the right entry and loads whatever modules it carries.
       //
       // The library paths are reported as they appear inside the target's
       // mount namespace; for containerized rbd clients (podman / docker)
-      // those paths don't exist on the host.  Read the build-ids through
+      // those paths don't exist on the host.  Read the build-id through
       // /proc/<pid>/root/ when a target PID is specified so the read sees
-      // the same files the uprobe will attach to.
+      // the same file the uprobe will attach to.
       auto bid_path = [process_id](const std::string& p) -> std::string {
           if (process_id == -1) return p;
           return "/proc/" + std::to_string(process_id) + "/root" + p;
       };
       std::vector<std::pair<std::string, std::string>> rados_mods = {
-          {get_basename(librbd_path),
-              get_elf_build_id(bid_path(librbd_path))},
-          {get_basename(librados_path),
-              get_elf_build_id(bid_path(librados_path))},
           {get_basename(libceph_common_path),
               get_elf_build_id(bid_path(libceph_common_path))},
       };
