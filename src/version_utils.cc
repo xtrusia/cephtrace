@@ -220,48 +220,54 @@ bool check_library_deleted(int process_id, const std::string& lib_name) {
     return false;
 }
 
-std::string find_library_path(const std::string& lib_name, int pid) {
-    int old_root_fd = -1;
-    int old_cwd_fd = -1;
-    bool did_chroot = false;
-    std::string result;
-
-    // If PID is specified, chroot to the process's root
-    if (pid != -1) {
-        // Save current working directory and root directory
-        old_cwd_fd = open(".", O_RDONLY | O_DIRECTORY);
-        old_root_fd = open("/", O_RDONLY | O_DIRECTORY);
-
-        if (old_root_fd < 0 || old_cwd_fd < 0) {
-            std::cerr << "Warning: Failed to save current directories: " << strerror(errno) << std::endl;
-            std::cerr << "Falling back to host filesystem search" << std::endl;
-            if (old_root_fd >= 0) close(old_root_fd);
-            if (old_cwd_fd >= 0) close(old_cwd_fd);
-            old_root_fd = -1;
-            old_cwd_fd = -1;
-            // Fall through to normal search
-        } else {
-            // Chroot to process's root filesystem
-            std::string proc_root = "/proc/" + std::to_string(pid) + "/root";
-            if (chroot(proc_root.c_str()) == 0) {
-                did_chroot = true;
-                if (chdir("/") != 0) {
-                    std::cerr << "Warning: Failed to chdir to new root: " << strerror(errno) << std::endl;
-                }
-                std::clog << "Chrooted to " << proc_root << " to search for " << lib_name << std::endl;
-            } else {
-                std::cerr << "Warning: chroot to " << proc_root << " failed: " << strerror(errno) << std::endl;
-                std::cerr << "This usually requires root privileges or CAP_SYS_CHROOT capability" << std::endl;
-                std::cerr << "Falling back to host filesystem search" << std::endl;
-                close(old_root_fd);
-                close(old_cwd_fd);
-                old_root_fd = -1;
-                old_cwd_fd = -1;
-            }
-        }
+// Find library path by parsing /proc/<pid>/maps.
+// This is more reliable than dlopen or a static directory search when
+// targeting a specific process: the maps name the exact file the process
+// loaded, covering containerized and snap-confined layouts (e.g. LXD's qemu
+// mapping librbd from /snap/lxd/<rev>/lib/...).  The returned path is
+// relative to the target's mount namespace; callers prefix /proc/<pid>/root.
+static std::string find_library_path_from_maps(const std::string& lib_name, int pid) {
+    std::string maps_path = "/proc/" + std::to_string(pid) + "/maps";
+    std::ifstream maps_file(maps_path);
+    if (!maps_file.is_open()) {
+        std::cerr << "Warning: Could not open " << maps_path << std::endl;
+        return "";
     }
 
-    // First try to find the library using dlopen
+    std::string line;
+    while (std::getline(maps_file, line)) {
+        // /proc/pid/maps format: address perms offset dev inode pathname
+        size_t slash = line.find('/');
+        if (slash == std::string::npos ||
+            line.find("(deleted)", slash) != std::string::npos)
+            continue;
+        std::string path = line.substr(slash);
+        std::string base = path.substr(path.find_last_of('/') + 1);
+        // Match the soname as a prefix so versioned filenames resolve too
+        // (librbd.so.1 -> librbd.so.1.17.0).
+        if (base.compare(0, lib_name.size(), lib_name) == 0) {
+            std::clog << "Found library " << lib_name << " from maps at: "
+                      << path << std::endl;
+            return path;
+        }
+    }
+    return "";
+}
+
+std::string find_library_path(const std::string& lib_name, int pid) {
+    // If a PID is specified, the process's maps are authoritative: a library
+    // that isn't mapped there can't be uprobed in that process anyway, so no
+    // filesystem fallback is attempted.
+    if (pid != -1) {
+        std::string result = find_library_path_from_maps(lib_name, pid);
+        if (result.empty()) {
+            std::cerr << "Could not find " << lib_name << " in /proc/" << pid
+                      << "/maps" << std::endl;
+        }
+        return result;
+    }
+
+    // No PID: find the library on the host.  First try dlopen.
     void* handle = dlopen(lib_name.c_str(), RTLD_LAZY | RTLD_NOLOAD);
     if (!handle) {
         // If not loaded, try to load it
@@ -276,81 +282,52 @@ std::string find_library_path(const std::string& lib_name, int pid) {
             dlclose(handle);
             if (!path.empty() && path != lib_name) {
                 std::clog << "Found library " << lib_name << " at: " << path << std::endl;
-                result = path;
-                goto cleanup;
+                return path;
             }
+        } else {
+            dlclose(handle);
         }
-        dlclose(handle);
     }
 
     // Fallback: search in common library directories
-    {
-        std::vector<std::string> search_dirs = {
-            "./lib",
-            "/lib",
-            "/lib64",
-            "/lib64/ceph",
-            "/usr/lib",
-            "/usr/lib64",
-            "/usr/lib64/ceph",
-            "/lib/x86_64-linux-gnu",
-            "/usr/lib/x86_64-linux-gnu",
-            "/usr/lib/x86_64-linux-gnu/ceph",
-            "/usr/local/lib",
-            "/snap/microceph/current/lib/x86_64-linux-gnu",
-            "/snap/microceph/current/lib/x86_64-linux-gnu/ceph"
-        };
+    std::vector<std::string> search_dirs = {
+        "./lib",
+        "/lib",
+        "/lib64",
+        "/lib64/ceph",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/lib64/ceph",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu/ceph",
+        "/usr/local/lib",
+        "/snap/microceph/current/lib/x86_64-linux-gnu",
+        "/snap/microceph/current/lib/x86_64-linux-gnu/ceph"
+    };
 
-        // Try different possible filenames for the library
-        std::vector<std::string> possible_names;
-        if (lib_name.find(".so") == std::string::npos) {
-            // If no .so extension, try common patterns
-            possible_names.push_back("lib" + lib_name + ".so");
-            possible_names.push_back("lib" + lib_name + ".so.1");
-            possible_names.push_back("lib" + lib_name + ".so.2");
-        } else {
-            possible_names.push_back(lib_name);
-        }
+    // Try different possible filenames for the library
+    std::vector<std::string> possible_names;
+    if (lib_name.find(".so") == std::string::npos) {
+        // If no .so extension, try common patterns
+        possible_names.push_back("lib" + lib_name + ".so");
+        possible_names.push_back("lib" + lib_name + ".so.1");
+        possible_names.push_back("lib" + lib_name + ".so.2");
+    } else {
+        possible_names.push_back(lib_name);
+    }
 
-        for (const auto& dir : search_dirs) {
-            for (const auto& name : possible_names) {
-                std::string full_path = dir + "/" + name;
-                if (access(full_path.c_str(), F_OK) == 0) {
-                    std::clog << "Found library " << lib_name << " at: " << full_path << std::endl;
-                    result = full_path;
-                    goto cleanup;
-                }
+    for (const auto& dir : search_dirs) {
+        for (const auto& name : possible_names) {
+            std::string full_path = dir + "/" + name;
+            if (access(full_path.c_str(), F_OK) == 0) {
+                std::clog << "Found library " << lib_name << " at: " << full_path << std::endl;
+                return full_path;
             }
         }
     }
 
-cleanup:
-    // Restore original root and working directory if we chrooted
-    if (did_chroot && old_root_fd >= 0) {
-        // First restore the root filesystem
-        if (fchdir(old_root_fd) != 0) {
-            std::cerr << "Error: Failed to fchdir back to original root: " << strerror(errno) << std::endl;
-        }
-        if (chroot(".") != 0) {
-            std::cerr << "Error: Failed to chroot back to original root: " << strerror(errno) << std::endl;
-        }
-        // Then restore the original working directory
-        if (old_cwd_fd >= 0) {
-            if (fchdir(old_cwd_fd) != 0) {
-                std::cerr << "Error: Failed to restore original working directory: " << strerror(errno) << std::endl;
-            }
-        }
-        std::clog << "Restored original root filesystem and working directory" << std::endl;
-    }
-
-    if (old_root_fd >= 0) {
-        close(old_root_fd);
-    }
-    if (old_cwd_fd >= 0) {
-        close(old_cwd_fd);
-    }
-
-    return result;
+    return "";
 }
 
 std::string find_executable_path(const std::string& exe_name) {
