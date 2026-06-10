@@ -246,6 +246,19 @@ static std::string find_library_path_from_maps(const std::string& lib_name, int 
         // Match the soname as a prefix so versioned filenames resolve too
         // (librbd.so.1 -> librbd.so.1.17.0).
         if (base.compare(0, lib_name.size(), lib_name) == 0) {
+            // Prefer the soname symlink next to the real file when it exists
+            // (librbd.so.1.19.0 -> librbd.so.1): the DWARF function tables
+            // are keyed by soname basename (mod_func2pc/mod_func2vf), so a
+            // versioned basename would make every lookup miss and silently
+            // skip the uprobes on that library.
+            if (base != lib_name) {
+                std::string soname_path =
+                    path.substr(0, path.find_last_of('/') + 1) + lib_name;
+                std::string host_view =
+                    "/proc/" + std::to_string(pid) + "/root" + soname_path;
+                if (access(host_view.c_str(), F_OK) == 0)
+                    path = soname_path;
+            }
             std::clog << "Found library " << lib_name << " from maps at: "
                       << path << std::endl;
             return path;
