@@ -42,6 +42,9 @@ jobs:
       - name: Embedded DWARF data test - verify integrity and E2E
         run: sudo ./tests/functional-test-embedded-dwarf.sh
 
+      - name: Functional test - radostrace tracing a qemu VM on an RBD disk
+        run: sudo ./tests/functional-test-qemu-rbd.sh
+
   build-ubuntu-cephadm:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35

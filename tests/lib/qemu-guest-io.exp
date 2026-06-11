@@ -1,0 +1,59 @@
+#!/usr/bin/expect -f
+# Boot a cirros guest from an RBD-backed virtio disk and generate guest I/O.
+#
+# Usage: qemu-guest-io.exp <accel> <drive-file-uri>
+#   accel          qemu -machine accel= value (kvm or tcg)
+#   drive-file-uri qemu block URI, e.g. rbd:test_pool/vmdisk:rbd_cache=false
+#
+# The guest writes 32 MiB (fsync'd) and then reads 80 MiB straight from
+# /dev/vda; each phase echoes a marker (DD_WRITE_OK / DD_READ_OK) that the
+# caller greps for in the captured console log to prove the I/O really ran.
+set accel [lindex $argv 0]
+set drive [lindex $argv 1]
+
+# TCG boots are slow; give the whole session a generous ceiling.
+set timeout 480
+
+# -nic none: without it qemu adds a default user-mode NIC, and cirros's
+# cloud-metadata probe (169.254.169.254) then hangs ~50 s per retry x20
+# before giving up - far past any reasonable expect timeout.  With no NIC
+# the probe fails instantly and the login prompt appears in seconds.
+spawn qemu-system-x86_64 -machine accel=$accel -cpu max -m 512 \
+    -drive format=raw,file=$drive,if=virtio,cache=none \
+    -nic none -nographic -monitor none
+
+# The cirros banner prints "login as 'cirros' user" before the real prompt,
+# so match the exact prompt string instead of bare "login:".
+expect {
+    -ex "cirros login:" {}
+    timeout { puts "EXPECT_TIMEOUT waiting for login prompt"; exit 1 }
+    eof     { puts "EXPECT_EOF before login prompt"; exit 1 }
+}
+sleep 1
+send "cirros\r"
+expect {
+    -ex "Password:" {}
+    timeout { puts "EXPECT_TIMEOUT waiting for password prompt"; exit 1 }
+}
+send "gocubsgo\r"
+expect {
+    -ex "$ " {}
+    timeout { puts "EXPECT_TIMEOUT waiting for shell"; exit 1 }
+}
+
+send "sudo sh -c 'dd if=/dev/zero of=/root/ddfile bs=4096 count=8192 conv=fsync && sync && echo DD_WRITE_OK'\r"
+expect {
+    -ex "DD_WRITE_OK" {}
+    timeout { puts "EXPECT_TIMEOUT waiting for guest write"; exit 1 }
+}
+expect -ex "$ "
+
+send "sudo sh -c 'dd if=/dev/vda of=/dev/null bs=4096 count=20000 && echo DD_READ_OK'\r"
+expect {
+    -ex "DD_READ_OK" {}
+    timeout { puts "EXPECT_TIMEOUT waiting for guest read"; exit 1 }
+}
+expect -ex "$ "
+
+send "sudo poweroff\r"
+expect eof
