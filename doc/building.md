@@ -40,3 +40,21 @@ cd cephtrace
 git submodule update --init --recursive
 make
 ```
+
+## Kernel BTF requirement (kfstrace)
+
+The `GEN-BTF` build step generates `src/ceph_btf_local.h` from the **ceph
+kernel module** of the newest kernel installed under `/lib/modules`, using
+that kernel's vmlinux BTF as the base. The build host therefore needs:
+
+- a kernel package providing `ceph.ko` (on Ubuntu:
+  `linux-modules-extra-<version>`), and
+- a readable base BTF for that same kernel - one of
+  `/lib/modules/<ver>/vmlinux`, `/usr/lib/debug/.../vmlinux`,
+  `/boot/vmlinux-<ver>`, or `/sys/kernel/btf/vmlinux` when the installed
+  kernel is also the running one.
+
+This works in containers and CI runners as long as a matching kernel package
+is installed - the kernel does not have to be running. The generated header is
+CO-RE relocatable: binaries built against one kernel's `ceph.ko` run on other
+kernels with BTF support (the field offsets are re-resolved at load time).

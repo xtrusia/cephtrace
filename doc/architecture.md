@@ -35,9 +35,10 @@ cephtrace/
 Each tool follows this pattern:
 
 ```
-1. Parse DWARF information
-   ├─ Read debug symbols from installed packages
-   ├─ Or import from pre-generated JSON file
+1. Resolve DWARF information (radostrace/osdtrace)
+   ├─ Match embedded DWARF data by the target's ELF build-id
+   ├─ Or import from a pre-generated JSON file (-i)
+   ├─ Or parse debug symbols from installed packages
    └─ Extract struct layouts and function addresses
 
 2. Load and attach eBPF program

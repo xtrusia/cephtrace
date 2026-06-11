@@ -31,21 +31,45 @@ Run osdtrace on **Ceph OSD nodes** to:
 
 ## Quick Start
 
-### With Pre-built Binary and DWARF File (Ubuntu)
+### With Pre-built Binary (Ubuntu)
+
+osdtrace ships with DWARF data for many Ceph releases **compiled into the binary**
+(keyed by the `ceph-osd` ELF build-id), so for covered versions no DWARF download
+or debug symbols are needed:
 
 ```bash
 # Download osdtrace
 wget https://github.com/taodd/cephtrace/releases/latest/download/osdtrace
 chmod +x osdtrace
 
+# Discover the OSDs on this host and whether they are traceable as-is
+sudo ./osdtrace --list
+#  PID        OSD ID     Container    Traceable   Ceph Version
+#  -----------------------------------------------------------------------
+#  4373       0          yes          yes         19.2.3-0ubuntu0.24.04.3
+
+# Trace one OSD by ID
+sudo ./osdtrace --id 0
+
+# Or trace every traceable ceph-osd on the host
+sudo ./osdtrace -a
+```
+
+Use `./osdtrace --list-embedded` to see all Ceph versions with compiled-in DWARF
+data. If your version is not embedded, fall back to a DWARF JSON file (`-i`) or
+debug symbols (below).
+
+### With a DWARF JSON File
+
+```bash
 # Check your ceph-osd version
 dpkg -l | grep ceph-osd
 
 # Download matching DWARF file
-wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/osdtrace/17.2.6-0ubuntu0.22.04.2_dwarf.json
+wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/osdtrace/osd-17.2.9-0ubuntu0.22.04.3_dwarf.json
 
-# Start tracing with extended output (-x flag)
-sudo ./osdtrace -i 17.2.6-0ubuntu0.22.04.2_dwarf.json -x
+# Start tracing
+sudo ./osdtrace -i osd-17.2.9-0ubuntu0.22.04.3_dwarf.json
 ```
 
 ### With Debug Symbols Installed
@@ -54,49 +78,81 @@ sudo ./osdtrace -i 17.2.6-0ubuntu0.22.04.2_dwarf.json -x
 # Install debug symbols
 sudo apt-get install ceph-osd-dbgsym
 
-# Run osdtrace
-sudo ./osdtrace -x
+# Run osdtrace (parses DWARF from the installed binary at startup)
+sudo ./osdtrace
 ```
 
 ## Command-Line Options
 
-### Basic Options
+```
+-p <pid1,pid2,...>         Probe using process IDs (comma-separated; mandatory
+                           for tracing containerized processes by PID)
+--id <osd-id1,osd-id2,...> Probe by OSD ID (comma-separated; resolves to PIDs
+                           via automatic discovery)
+-a, --all                  Trace ALL traceable ceph-osd processes on the host
+                           (native and containerized)
+-t <seconds>               Set execution timeout in seconds
+-s                         Single OP probe mode (logs PrimaryLogPG::log_op_stats
+                           only - lower overhead, one line per op)
+-b                         Bluestore probe mode (BlueStore-layer probes only)
+-l <milliseconds>          Only capture operations slower than this threshold
+-i <filename>              Import DWARF info from JSON file
+-j <filename>              Export DWARF info to JSON file and exit
+--skip-version-check       Skip version check when importing DWARF JSON
+                           (needed when host/container package versions differ)
+--list                     List active ceph-osd processes (PID, OSD ID,
+                           container status, traceability, version) and exit
+--list-embedded            List Ceph versions with DWARF data compiled into
+                           this binary and exit
+-V, --version              Print version information and exit
+-h                         Show help message
+```
 
-```
--p, --pid <PID>          Trace specific OSD process ID only
--t, --time <seconds>     Run for specified duration then exit
--x, --extended           Show extended latency breakdown
--i, --import <file>      Import DWARF data from JSON file
--j, --json <file>        Export DWARF data to JSON file and exit
---skip-version-check     Skip version compatibility check when importing
--h, --help              Show help message
-```
+By default osdtrace runs in **full tracing mode**, printing the complete latency
+breakdown (messenger, OSD, peers, BlueStore sub-latencies) for every operation.
+The former `-x` flag is gone - its output is now the default; the `-d` and `-m`
+aggregation options were removed at the same time.
 
 ### Examples
 
-#### Trace all OSDs with extended output
+#### Discover OSDs, then trace by OSD ID
 ```bash
-sudo ./osdtrace -x
+sudo ./osdtrace --list
+sudo ./osdtrace --id 3          # one OSD
+sudo ./osdtrace --id 3,5,7      # several OSDs
 ```
 
-#### Trace a specific OSD
+#### Trace all traceable OSDs on the host
 ```bash
-# Find the OSD process ID
-ps aux | grep ceph-osd
+sudo ./osdtrace -a
+```
 
-# Trace that specific OSD
-sudo ./osdtrace -p 12345 -x
+#### Trace specific PIDs
+```bash
+sudo ./osdtrace -p 12345
+sudo ./osdtrace -p 12345,12399
+```
+
+#### Only show slow operations
+```bash
+# Capture only ops slower than 50 ms
+sudo ./osdtrace --id 0 -l 50
+```
+
+#### Low-overhead single-line mode
+```bash
+sudo ./osdtrace --id 0 -s
 ```
 
 #### Trace for a limited time
 ```bash
 # Trace for 60 seconds then exit
-sudo ./osdtrace -t 60 -x
+sudo ./osdtrace --id 0 -t 60
 ```
 
 #### Use DWARF JSON file
 ```bash
-sudo ./osdtrace -i /path/to/osdtrace_dwarf.json -x
+sudo ./osdtrace -i /path/to/osdtrace_dwarf.json
 ```
 
 #### Generate DWARF JSON file
@@ -107,11 +163,16 @@ sudo ./osdtrace -j osdtrace_dwarf.json
 
 #### Trace containerized OSD
 ```bash
-# Find the ceph-osd process ID on the host
-ps aux | grep ceph-osd
+# Discover containerized OSDs (Container column = yes)
+sudo ./osdtrace --list
 
-# Skip version check for container mismatch
-sudo ./osdtrace -p 12345 -i dwarf.json --skip-version-check -x
+# Embedded DWARF data is matched by build-id even inside containers,
+# so for covered versions this just works:
+sudo ./osdtrace --id 2
+
+# For versions without embedded data, import a JSON matching the
+# *container's* Ceph version and skip the host version check:
+sudo ./osdtrace -p 12345 -i dwarf.json --skip-version-check
 ```
 
 ## Output Format
@@ -153,11 +214,11 @@ Each operation is labeled by type:
 | **osd_lat** | OSD processing time | μs | All ops |
 | **peers** | Replica wait times | [(osd, μs), ...] | op_w only |
 | **bluestore_lat** | Total BlueStore time | μs | All ops |
-| **prepare** | Transaction prep | μs | Extended (-x) |
-| **aio_wait** | Async I/O wait | μs | Extended (-x) |
-| **aio_size** | Async I/O size | bytes | Extended (-x) |
-| **seq_wait** | Sequencer wait | μs | Extended (-x) |
-| **kv_commit** | KV store commit | μs | Extended (-x) |
+| **prepare** | Transaction prep | μs | Write ops |
+| **aio_wait** | Async I/O wait | μs | Write ops |
+| **aio_size** | Async I/O size | bytes | Write ops |
+| **seq_wait** | Sequencer wait | μs | Write ops |
+| **kv_commit** | KV store commit | μs | Write ops |
 | **op_lat / subop_lat** | Total end-to-end latency | μs | All ops |
 
 Note:
@@ -218,7 +279,7 @@ osd 38 pg 20.16b op_w size 12288 client 179589331 tid 24057 throttle_lat 2 recv_
 
 **bluestore_lat: 10639μs (10.6ms)** - Total BlueStore processing
 
-With `-x` flag, broken down into:
+For write operations this is broken down into:
 
 **prepare: 107μs**
 - Transaction preparation
@@ -295,13 +356,10 @@ osd_lat 100 peers [(5, 5000), (10, 48000)] bluestore_lat 2000 ...
 ### Scenario 1: Diagnosing Slow Ops
 
 ```bash
-# Start tracing with extended output
-sudo ./osdtrace -x > /tmp/osdtrace.log
+# Trace every traceable OSD on the host; only capture ops slower than 10 ms
+sudo ./osdtrace -a -l 10 > /tmp/osdtrace.log
 
 # Let it run during slow ops, then analyze
-# Find operations with high latency
-awk '$NF > 10000' /tmp/osdtrace.log | head -20
-
 # Look for patterns in the latency breakdown
 ```
 
@@ -309,14 +367,14 @@ awk '$NF > 10000' /tmp/osdtrace.log | head -20
 
 ```bash
 # Trace a specific OSD that's showing issues
-sudo ./osdtrace -p $OSD_PID -x -t 300 > osd5_trace.log
+sudo ./osdtrace --id 5 -t 300 > osd5_trace.log
 ```
 
 ### Scenario 3: Comparing Primary vs Replica Performance
 
 ```bash
 # Trace all OSDs, then filter
-sudo ./osdtrace -x > full_trace.log
+sudo ./osdtrace -a > full_trace.log
 
 # Analyze primary operations (op_r, op_w)
 grep -E "op_r|op_w" full_trace.log > primary_ops.log

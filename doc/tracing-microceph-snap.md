@@ -7,13 +7,30 @@ MicroCeph deploys Ceph using snap packages, which provides a self-contained Ceph
 **Key Points:**
 - Tracing process is similar to containerized Ceph deployments
 - Binary runs on host, traced process runs inside snap namespace
-- DWARF files must match the snap's Ceph version, not the host's
-- **Critical:** Use snap manifest to determine exact Ceph package version
+- DWARF data must match the snap's Ceph version, not the host's
 
-**Solutions:**
+**The easy path (v1.6+): embedded DWARF data.** The tools resolve the
+libraries a snap-confined process actually loaded from `/proc/<pid>/maps`
+(e.g. `/snap/microceph/<rev>/lib/...` or LXD's qemu under `/snap/lxd/<rev>/...`)
+and match the embedded DWARF data by ELF build-id. For covered versions no
+manifest lookup, DWARF download, or `--skip-version-check` is needed:
+
+```bash
+# Discover snap-confined clients / OSDs and check coverage (Traceable column)
+sudo ./radostrace --list
+sudo ./osdtrace --list
+
+# Trace directly
+sudo ./radostrace -p <HOST_PID>
+sudo ./osdtrace --id <OSD_ID>
+```
+
+The rest of this guide covers the manual DWARF-file flow, needed only when the
+snap's Ceph version is not embedded (check with `--list-embedded`):
 - Use `--skip-version-check` flag
 - Specify exact process ID with `-p`
 - Generate or download DWARF files matching snap's Ceph version
+- **Critical:** Use snap manifest to determine exact Ceph package version
 
 ## Determining Snap's Ceph Version
 
@@ -97,13 +114,13 @@ wget https://github.com/taodd/cephtrace/releases/latest/download/osdtrace
 chmod +x osdtrace
 
 # 3. Download DWARF file matching the snap's ceph-osd version
-wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/osdtrace/17.2.6-0ubuntu0.22.04.3_dwarf.json
+wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/osdtrace/osd-17.2.6-0ubuntu0.22.04.3_dwarf.json
 
 # 4. Find the ceph-osd process PID on the host
 ps aux | grep ceph-osd
 
-# 5. Trace with --skip-version-check and extended output
-sudo ./osdtrace -i 17.2.6-0ubuntu0.22.04.3_dwarf.json -p <HOST_PID> --skip-version-check -x
+# 5. Trace with --skip-version-check
+sudo ./osdtrace -i osd-17.2.6-0ubuntu0.22.04.3_dwarf.json -p <HOST_PID> --skip-version-check
 ```
 
 ## Generating DWARF Files for MicroCeph

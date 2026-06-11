@@ -22,6 +22,7 @@ Cephtrace is a suite of **eBPF-based dynamic tracing tools** that provide **micr
 - **📊 Per-IO Latency Breakdown** - See exactly where each operation spends its time
 - **🔄 No Downtime Required** - Attach and detach from running processes dynamically
 - **⚙️  No Configuration Needed** - Just start tracing on the fly, no service restarts or config changes
+- **🔋 Batteries Included** - DWARF data for many Ceph releases is compiled into the binaries and matched by ELF build-id; use `--list` to discover traceable processes and `--list-embedded` to see covered versions
 - **📦 Works with Containers** - Full support for cephadm, Rook, Docker, lxd and MicroCeph
 - **🚀 Low Overhead in Production** - eBPF with the kernel uprobe dynamic instrumentation
 
@@ -76,23 +77,23 @@ Get up and running in under 2 minutes - monitor VM I/O operations hitting your C
 wget https://github.com/taodd/cephtrace/releases/latest/download/radostrace
 chmod +x radostrace
 
-# Check your librados version on the host
-dpkg -l | grep librados2
-
-# Download matching DWARF file (example for Ubuntu 22.04, Ceph 17.2.6)
-wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/radostrace/17.2.6-0ubuntu0.22.04.2_dwarf.json
-
-# Find the QEMU process for your VM
-ps aux | grep qemu
+# Discover the Ceph client processes on the host (qemu VMs, rgw, ...).
+# Traceable=yes means the binary's embedded DWARF data covers that version -
+# no DWARF file or debug symbols needed.
+sudo ./radostrace --list
 
 # Start tracing the VM's RBD operations (replace <qemu-pid> with actual PID)
-sudo ./radostrace -i 17.2.6-0ubuntu0.22.04.2_dwarf.json -p <qemu-pid>
+sudo ./radostrace -p <qemu-pid>
 
-# Or trace all VMs on the host
-sudo ./radostrace -i 17.2.6-0ubuntu0.22.04.2_dwarf.json
+# Or trace all librados clients on the host
+sudo ./radostrace
+
+# For Ceph versions without embedded coverage (Traceable=no), import a
+# matching DWARF JSON from the files/ directory instead:
+sudo ./radostrace -i 17.2.9-0ubuntu0.22.04.3_dwarf.json -p <qemu-pid>
 ```
 
-### Sampl Output:
+### Sample Output:
 
 ```
      pid  client     tid  pool  pg     acting       w/r    size  latency     object[ops][offset,length]
@@ -101,7 +102,7 @@ sudo ./radostrace -i 17.2.6-0ubuntu0.22.04.2_dwarf.json
    19015   34206  419359     2  39     [0,121,11]     R     4096    1240     rbd_data.374de3730ad0.0000000000000000[read ][0, 4096]
    19015   34206  419360     2  39     [0,121,11]     R     4096    1705     rbd_data.374de3730ad0.0000000000000000[read ][4096, 4096]
    19015   34206  419361     2  39     [0,121,11]     R     4096    1334     rbd_data.374de3730ad0.0000000000000000[read ][12288, 4096]
-   19015   34206  419362     2  2b     [77,11,1]     iR     4096    2180     rbd_data.374de3730ad0.00000000000000ff[read ][4128768, 4096]
+   19015   34206  419362     2  2b     [77,11,1]      R     4096    2180     rbd_data.374de3730ad0.00000000000000ff[read ][4128768, 4096]
 ```
 
 📖 **Detailed guide:** [Getting Started](doc/getting-started.md)
@@ -139,7 +140,7 @@ See cephtrace in action troubleshooting real performance issues.
 
 ## Requirements
 - **Kernel:** Linux 5.8 or later
-- **Architecture:** x86_64
+- **Architecture:** x86_64, ARM64
 
 ## 🤝 Contributing
 

@@ -53,7 +53,7 @@ When using `-f` option, you can analyze these latency components:
 
 ```bash
 # Capture osdtrace output
-sudo ./osdtrace -x -t 300 > osdtrace.log
+sudo ./osdtrace -a -t 300 > osdtrace.log
 
 # Analyze all operations
 ./tools/analyze_osdtrace_output.py osdtrace.log
@@ -180,8 +180,8 @@ as described in example 1 or 2 (but with `-f bluestore_lat`)
 ### Step 1: Capture Detailed Trace
 
 ```bash
-# Use -x for extended BlueStore breakdown
-sudo ./osdtrace -x -t 300 > osdtrace-$(date +%Y%m%d-%H%M%S).log
+# Full tracing mode (default) includes the BlueStore breakdown
+sudo ./osdtrace -a -t 300 > osdtrace-$(date +%Y%m%d-%H%M%S).log
 ```
 
 ### Step 2: Quick Overview of Latency Contributions
@@ -236,14 +236,14 @@ done
 
 ```bash
 # Before tuning
-sudo ./osdtrace -x -t 300 > before.log
+sudo ./osdtrace -a -t 300 > before.log
 ./tools/analyze_osdtrace_output.py before.log -f kv_commit > before-analysis.txt
 
 # Apply tuning (e.g., RocksDB settings)
 ceph config set osd bluestore_rocksdb_options "..."
 
 # After tuning
-sudo ./osdtrace -x -t 300 > after.log
+sudo ./osdtrace -a -t 300 > after.log
 ./tools/analyze_osdtrace_output.py after.log -f kv_commit > after-analysis.txt
 
 # Compare
