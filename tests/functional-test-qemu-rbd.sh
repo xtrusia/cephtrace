@@ -36,6 +36,7 @@ POOL=${POOL:-test_pool}
 IMAGE=${IMAGE:-vmdisk}
 
 RADOSTRACE_LOG=/tmp/radostrace-qemu.log
+RADOSTRACE_ERR=/tmp/radostrace-qemu.err
 CONSOLE_LOG=/tmp/qemu-console.log
 CIRROS_IMG=${CIRROS_IMG:-/tmp/cirros-0.6.2-x86_64-disk.img}
 CIRROS_URL=https://download.cirros-cloud.net/0.6.2/cirros-0.6.2-x86_64-disk.img
@@ -65,6 +66,11 @@ cleanup() {
         info "radostrace output (tail):"
         tail -50 $RADOSTRACE_LOG
         info " === END of radostrace output === "
+    fi
+    if [[ -e $RADOSTRACE_ERR ]]; then
+        info "radostrace stderr (tail):"
+        tail -20 $RADOSTRACE_ERR
+        info " === END of radostrace stderr === "
     fi
     if [[ -e $CONSOLE_LOG ]]; then
         info "guest console (tail):"
@@ -163,7 +169,11 @@ info "=== Step 6: Trace the qemu process with radostrace ==="
 # No -i, no --skip-version-check: embedded DWARF matched by build-id.
 # The 600 s ceiling comfortably outlasts a TCG boot; the trace is stopped
 # as soon as the guest powers off.
-timeout 600 "$PROJECT_ROOT/radostrace" -p "$QEMU_PID" >"$RADOSTRACE_LOG" 2>&1 &
+# stderr goes to its own file: tool log lines (e.g. "Caught signal 2" on
+# our SIGINT) otherwise interleave mid-row with stdout in the shared file
+# and the split fragments confuse the row parser.
+timeout 600 "$PROJECT_ROOT/radostrace" -p "$QEMU_PID" \
+    >"$RADOSTRACE_LOG" 2>"$RADOSTRACE_ERR" &
 RADOSTRACE_BG=$!
 sleep 3
 if ! kill -0 $RADOSTRACE_BG 2>/dev/null; then
@@ -193,9 +203,19 @@ info "=== Step 7: Verify radostrace output ==="
 POOL_ID=$($CEPH_CMD osd pool ls detail | awk -v p="'$POOL'" '$1 == "pool" && $3 == p {print $2}')
 info "Pool $POOL has id ${POOL_ID:-unknown}"
 
-total=0; writes=0; reads=0; rbd_data_rows=0; bad_pool=0
+total=0; writes=0; reads=0; rbd_data_rows=0; bad_pool=0; malformed=0
 while IFS='|' read -r pid _client _tid pool _pg _acting wr _size _latency object; do
     [ -z "$pid" ] && continue
+    # Reject fragments that slipped past the loose row filter (e.g. a row
+    # split by an interleaved log line, or cut by an unclean kill): a real
+    # row always has W/R in the wr column and a numeric pool id.
+    case "$wr" in
+        W|R) ;;
+        *) malformed=$((malformed + 1)); continue ;;
+    esac
+    case "$pool" in
+        ''|*[!0-9]*) malformed=$((malformed + 1)); continue ;;
+    esac
     total=$((total + 1))
     case "$wr" in
         W) writes=$((writes + 1)) ;;
@@ -207,7 +227,7 @@ while IFS='|' read -r pid _client _tid pool _pg _acting wr _size _latency object
     fi
 done < <(_radostrace_rows "$RADOSTRACE_LOG")
 
-info "radostrace captured: total=$total writes=$writes reads=$reads rbd_data_rows=$rbd_data_rows bad_pool=$bad_pool"
+info "radostrace captured: total=$total writes=$writes reads=$reads rbd_data_rows=$rbd_data_rows bad_pool=$bad_pool malformed=$malformed"
 
 fail=0
 if [ "$total" -lt "$MIN_TOTAL_ROWS" ]; then
@@ -228,6 +248,12 @@ if [ "$rbd_data_rows" -lt "$MIN_TOTAL_ROWS" ]; then
 fi
 if [ "$bad_pool" -gt 0 ]; then
     err "$bad_pool rows targeted a pool other than $POOL (id $POOL_ID)"
+    fail=1
+fi
+# A couple of malformed fragments can result from stopping the tool
+# mid-write; more than that points at an output-format regression.
+if [ "$malformed" -gt 5 ]; then
+    err "$malformed malformed rows (output format regression?)"
     fail=1
 fi
 [ "$fail" -eq 0 ] || exit 1
