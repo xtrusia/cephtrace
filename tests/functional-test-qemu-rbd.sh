@@ -131,25 +131,33 @@ expect "$SCRIPT_DIR/lib/qemu-guest-io.exp" "$ACCEL" \
     "rbd:$POOL/$IMAGE:rbd_cache=false" >"$CONSOLE_LOG" 2>&1 &
 EXPECT_PID=$!
 
-# Wait for the qemu process and confirm it mapped librbd (it opens the rbd
-# drive at startup, before the guest even boots).
-# pgrep -f, not -x: the comm name is truncated to 15 chars
-# ("qemu-system-x86"), so an exact-name match never fires.
+# Discover the qemu process with radostrace --list, the same way a user
+# would.  qemu maps libceph-common.so.2 (via librbd) as soon as it opens
+# the rbd drive at startup, so it appears in --list before the guest even
+# boots.  This also covers --list end to end: process discovery plus the
+# Traceable column's embedded build-id resolution for the qemu row.
+# Columns: PID  Container  Traceable  Ceph-Version  Executable-Path
 QEMU_PID=""
+QEMU_TRACEABLE=""
 for _ in $(seq 1 60); do
-    for pid in $(pgrep -f qemu-system-x86_64 2>/dev/null); do
-        if grep -q "librbd" "/proc/$pid/maps" 2>/dev/null; then
-            QEMU_PID=$pid
-            break 2
-        fi
-    done
+    # `|| true`: read returns 1 on an empty poll (qemu not registered in
+    # --list yet), which set -e would otherwise turn into a silent exit.
+    read -r QEMU_PID QEMU_TRACEABLE < <("$PROJECT_ROOT/radostrace" --list 2>/dev/null \
+        | awk '$5 ~ /qemu-system-x86_64$/ {print $1, $3; exit}') || true
+    [ -n "$QEMU_PID" ] && break
     sleep 0.5
 done
 if [ -z "$QEMU_PID" ]; then
-    err "Could not find a qemu-system-x86_64 process with librbd mapped"
+    err "radostrace --list did not report a qemu-system-x86_64 process"
+    "$PROJECT_ROOT/radostrace" --list || true
     exit 1
 fi
-info "Attaching radostrace to qemu PID $QEMU_PID (confirmed librbd-loaded)"
+if [ "$QEMU_TRACEABLE" != "yes" ]; then
+    err "radostrace --list reports qemu PID $QEMU_PID as Traceable=$QEMU_TRACEABLE"
+    "$PROJECT_ROOT/radostrace" --list || true
+    exit 1
+fi
+info "radostrace --list found qemu PID $QEMU_PID (Traceable=yes)"
 
 info "=== Step 6: Trace the qemu process with radostrace ==="
 # No -i, no --skip-version-check: embedded DWARF matched by build-id.
