@@ -39,7 +39,12 @@ RADOSTRACE_LOG=/tmp/radostrace-qemu.log
 RADOSTRACE_ERR=/tmp/radostrace-qemu.err
 CONSOLE_LOG=/tmp/qemu-console.log
 CIRROS_IMG=${CIRROS_IMG:-/tmp/cirros-0.6.2-x86_64-disk.img}
-CIRROS_URL=https://download.cirros-cloud.net/0.6.2/cirros-0.6.2-x86_64-disk.img
+# GitHub releases first: download.cirros-cloud.net regularly stalls from CI
+# runners (a 9-minute hang before curl's exit 28 took down one run).
+CIRROS_URLS=(
+    "https://github.com/cirros-dev/cirros/releases/download/0.6.2/cirros-0.6.2-x86_64-disk.img"
+    "https://download.cirros-cloud.net/0.6.2/cirros-0.6.2-x86_64-disk.img"
+)
 
 # Row thresholds.  A cirros boot + 32 MiB write + 80 MiB read produced
 # 200-400 rows in validation runs across octopus..tentacle; require a
@@ -121,8 +126,18 @@ $RBD_CMD rm "$POOL/$IMAGE" 2>/dev/null || true
 $RBD_CMD create --image-feature layering --size 1G "$POOL/$IMAGE"
 
 if [ ! -s "$CIRROS_IMG" ]; then
-    info "Downloading cirros guest image..."
-    curl -fsSL --retry 3 -o "$CIRROS_IMG" "$CIRROS_URL"
+    for url in "${CIRROS_URLS[@]}"; do
+        info "Downloading cirros guest image from $url ..."
+        if curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 \
+            -o "$CIRROS_IMG" "$url"; then
+            break
+        fi
+        rm -f "$CIRROS_IMG"
+    done
+    if [ ! -s "$CIRROS_IMG" ]; then
+        err "Could not download the cirros image from any mirror"
+        exit 1
+    fi
 fi
 # -n: write into the pre-created image, preserving its feature set
 qemu-img convert -n -O raw "$CIRROS_IMG" "rbd:$POOL/$IMAGE"
