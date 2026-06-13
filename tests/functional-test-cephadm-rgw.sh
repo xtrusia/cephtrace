@@ -27,6 +27,8 @@ source "$SCRIPT_DIR/lib/log.sh"
 source "$SCRIPT_DIR/lib/cephadm-setup.sh"
 # shellcheck source=lib/verify-trace-output.sh
 source "$SCRIPT_DIR/lib/verify-trace-output.sh"
+# shellcheck source=lib/verify-list-output.sh
+source "$SCRIPT_DIR/lib/verify-list-output.sh"
 
 OSDTRACE_LOG="/tmp/osdtrace-cephadm-${CEPH_RELEASE}.log"
 RADOSTRACE_LOG="/tmp/radostrace-cephadm-${CEPH_RELEASE}.log"
@@ -50,6 +52,7 @@ cleanup() {
     pkill -f "$PROJECT_ROOT/osdtrace" 2>/dev/null || true
     pkill -f "$PROJECT_ROOT/radostrace" 2>/dev/null || true
     pkill -f "s3cmd" 2>/dev/null || true
+    pkill -f "rados bench" 2>/dev/null || true
     if [[ -e "$OSDTRACE_LOG" ]]; then
         info "--- osdtrace tail (last 50 lines) ---"
         tail -50 "$OSDTRACE_LOG" || true
@@ -249,6 +252,53 @@ OSD_PID=$(pgrep -f "^[^ ]*ceph-osd .*-n[[:space:]]+osd\.1\b" | head -1)
 [ -n "$OSD_PID" ] || { err "could not find ceph-osd PID"; pgrep -af ceph-osd; exit 1; }
 
 info "RGW PID=$RGW_PID, OSD PID=$OSD_PID"
+
+
+############################################################################
+info "=== Step 10b: verify --list output over a multi-client host ==="
+# At this point the host runs a containerized MON, MGR, 3 OSDs, and the
+# radosgw.  Add one *native* (non-container) librados client - a host-side
+# rados bench - so --list must classify a mixed population: containerized
+# daemons (Container=yes, version = the container image's Ceph) alongside
+# a native client (Container=no, version = the host package).
+apt-get install -y -q ceph-common
+
+# quincy=17 reef=18 squid=19 tentacle=20: the containerized rows must all
+# report a version of this major.
+case "$CEPH_RELEASE" in
+    quincy)   EXPECTED_MAJOR=17 ;;
+    reef)     EXPECTED_MAJOR=18 ;;
+    squid)    EXPECTED_MAJOR=19 ;;
+    tentacle) EXPECTED_MAJOR=20 ;;
+    *) err "unknown release $CEPH_RELEASE"; exit 1 ;;
+esac
+
+cephadm shell --fsid "$FSID" -- ceph osd pool create list-test 8 >>"$WORKLOAD_LOG" 2>&1
+cephadm shell --fsid "$FSID" -- ceph osd pool application enable list-test rados >>"$WORKLOAD_LOG" 2>&1
+
+# Long-running native client; killed + cleaned up right after the checks.
+# The host rados CLI may be a different (newer/older) major than the
+# cluster - fine for bench I/O, and exactly the mixed-version situation
+# --list's per-process version resolution must get right.
+rados bench -p list-test 120 write -b 4096 --no-cleanup >>"$WORKLOAD_LOG" 2>&1 &
+BENCH_PID=$!
+sleep 3   # let it connect so libceph-common is mapped
+kill -0 "$BENCH_PID" 2>/dev/null || { err "native rados bench died at startup"; tail -5 "$WORKLOAD_LOG"; exit 1; }
+
+HOST_LIBRADOS_VER=$(dpkg-query -W -f='${Version}' librados2)
+info "native client: rados bench pid=$BENCH_PID, host librados2=$HOST_LIBRADOS_VER"
+
+verify_radostrace_list_multiclient "$PROJECT_ROOT/radostrace" \
+    "$EXPECTED_MAJOR" "$BENCH_PID" "$HOST_LIBRADOS_VER"
+verify_osdtrace_list_multiosd "$PROJECT_ROOT/osdtrace" "$EXPECTED_MAJOR" 3
+
+kill "$BENCH_PID" 2>/dev/null || true
+wait "$BENCH_PID" 2>/dev/null || true
+# No benchmark objects left behind; drop the throwaway pool entirely.
+rados -p list-test cleanup >>"$WORKLOAD_LOG" 2>&1 || true
+cephadm shell --fsid "$FSID" -- ceph config set mon mon_allow_pool_delete true >>"$WORKLOAD_LOG" 2>&1 || true
+cephadm shell --fsid "$FSID" -- ceph osd pool rm list-test list-test \
+    --yes-i-really-really-mean-it >>"$WORKLOAD_LOG" 2>&1 || true
 
 
 ############################################################################
