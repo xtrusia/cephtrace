@@ -7,9 +7,27 @@ When Ceph is deployed using containers (e.g., cephadm, Docker, Podman), tracing 
 **Key Challenges:**
 - Binary runs on host, traced process runs in container
 - Process namespaces require PID translation
-- DWARF files must match the container's Ceph version, not the host's
+- DWARF data must match the container's Ceph version, not the host's
 
-**Solutions:**
+**The easy path (v1.6+): embedded DWARF data.** Both tools compile in the
+DWARF data for many common Ceph releases and match it by the ELF build-id of
+the binary *inside the container* (read through `/proc/<pid>/root`). For
+covered versions - including the CentOS Stream images used by cephadm and
+Rook - tracing a container needs no DWARF download and no
+`--skip-version-check`:
+
+```bash
+# Discover containerized processes and check coverage (Traceable column)
+sudo ./radostrace --list     # clients (radosgw, qemu, ceph-mgr, ...)
+sudo ./osdtrace --list       # ceph-osd processes, with their OSD IDs
+
+# Trace directly
+sudo ./radostrace -p <HOST_PID>
+sudo ./osdtrace --id <OSD_ID>       # or: -p <HOST_PID>, or: -a for all
+```
+
+The rest of this guide covers the manual DWARF-file flow, needed only when
+your container's Ceph version is not embedded (check with `--list-embedded`):
 - Use `--skip-version-check` flag
 - Specify exact process ID with `-p`
 - Generate or download DWARF files matching container's Ceph version
@@ -94,10 +112,10 @@ chmod +x osdtrace
 wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/centos-stream/osdtrace/osd-2:19.2.3-0.el9_dwarf.json
 
 # Find the ceph-osd process PID on the host
-ps aux | grep ceph-osd 
+sudo ./osdtrace --list
 
-# Trace with --skip-version-check and extended output
-sudo ./osdtrace -i osd-2:19.2.3-0.el9_dwarf.json -p <HOST_PID> --skip-version-check -x
+# Trace with --skip-version-check
+sudo ./osdtrace -i osd-2:19.2.3-0.el9_dwarf.json -p <HOST_PID> --skip-version-check
 ```
 
 ### Tracing with Ubuntu Containers

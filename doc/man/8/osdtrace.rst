@@ -14,57 +14,83 @@ probe and trace OSD(s) on given nodes
 SYNOPSIS
 ========
 
-| **osdtrace** [-t <seconds>] [-j [filename]] [-i <filename>] [-o [filename]] [-p <pid>] -h
+| **osdtrace** [-s] [-b] [-l <milliseconds>] [-t <seconds>] [-j <filename>] [-i <filename>] [-a] [-p <pid1,pid2,...>] [--id <osd-id1,osd-id2,...>] [--skip-version-check] [--list] [--list-embedded] [-V] [-h]
 
 
 DESCRIPTION
 ===========
 
-**osdtrace** osdtrace can probe and trace OSD(s) directly on given nodes.
-  installed ``cephtrace``.
+**osdtrace** probes and traces ceph-osd processes directly on a given node,
+printing a per-operation latency breakdown across the messenger, OSD
+processing, and BlueStore layers. DWARF data for many Ceph releases is
+compiled into the binary (matched by the ceph-osd ELF build-id), so covered
+versions - including containerized OSDs - can be traced without debug symbols
+or DWARF JSON files.
 
 
 OPTIONS
 =======
 
--d <seconds>
+-s
 
-   Set probe duration in seconds to calculate average latency
+   Single OP probe mode: log PrimaryLogPG::log_op_stats only (lower overhead).
+   The default mode is full tracing with the complete latency breakdown.
 
--m <avg|max>
+-b
 
-   Set operation latency collection mode
+   Bluestore probe mode: BlueStore-layer probes only.
 
 -l <milliseconds>
 
    Set operation latency threshold to capture
 
--o <osd-id>
-
-   Only probe a specific OSD
-
--x
-
-   Set probe mode to Full OPs. See below for details
-
--b
-
-   Set probe mode to Bluestore. See below for details
-
--t
+-t <seconds>
 
    Set execution timeout in seconds
 
--j
+-j <filename>
 
-   Export DWARF parsing data
+   Export DWARF parsing data to a JSON file and exit
 
 -i <file>
 
    Import JSON DWARF data from file
 
+-a, --all
+
+   Trace ALL traceable ceph-osd processes on the host (native and
+   containerized)
+
+-p <pid1,pid2,...>
+
+   Probe using process IDs (comma-separated; mandatory for tracing
+   containerized processes by PID)
+
+--id <osd-id1,osd-id2,...>
+
+   Probe by OSD ID (comma-separated; resolves to PIDs via automatic
+   discovery)
+
+--skip-version-check
+
+   Skip the version check when importing DWARF JSON (needed when the host and
+   container package versions differ)
+
+--list
+
+   List active ceph-osd processes on the host (PID, OSD ID, container status,
+   traceability, Ceph version) and exit
+
+--list-embedded
+
+   List the Ceph versions with DWARF data compiled into this binary and exit
+
+-V, --version
+
+   Print version information and exit
+
 -h, --help
-   
+
    Show this help message
 
 

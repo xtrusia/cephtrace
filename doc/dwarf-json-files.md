@@ -2,6 +2,40 @@
 
 DWARF JSON files allow you to use cephtrace tools without installing debug symbols on every target machine. This guide explains how to generate, use, and manage these files.
 
+> **Check the embedded data first:** release binaries already contain the DWARF
+> data for many Ceph versions (see below). You only need a separate JSON file
+> when your version is not embedded.
+
+## Embedded DWARF Data
+
+Since v1.6, the radostrace and osdtrace release binaries ship with the DWARF
+data of many common Ceph releases **compiled in**. At startup the tool reads
+the ELF build-id of the target binary/library (through `/proc/<pid>/root` for
+containerized or snap-confined targets, so the in-container file is the one
+identified) and selects the matching embedded entry automatically:
+
+- **radostrace** matches on the `libceph-common.so.2` build-id
+- **osdtrace** matches on the `ceph-osd` build-id
+
+```bash
+# See which versions are compiled into your binary
+./radostrace --list-embedded
+./osdtrace --list-embedded
+
+# See whether the processes on this host are covered (Traceable column)
+sudo ./radostrace --list
+sudo ./osdtrace --list
+```
+
+When a build-id matches, no JSON file, no debug symbols, and no
+`--skip-version-check` are needed - this includes cephadm/Rook containers and
+MicroCeph/LXD snaps. When there is no match, the tools fall back to live DWARF
+parsing (requires debug symbols) or an imported JSON file (`-i`).
+
+Embedded coverage is refreshed automatically as new Ceph point releases ship.
+If your version is missing, generate a JSON file as described below - and
+consider submitting it as a PR to the `files/` directory.
+
 ## What are DWARF Files?
 
 DWARF is a debugging data format that contains information about:
@@ -49,19 +83,26 @@ File naming format: `<version>_dwarf.json`
 
 Location: `files/centos-stream/{radostrace,osdtrace}/`
 
-Available versions:
-- Ceph 18.2.7 (CentOS Stream 9)
-- Ceph 19.2.3 (CentOS Stream 9)
+Available versions include the el8/el9 builds used by cephadm container
+images, covering the Quincy (17.2.x), Reef (18.2.x), Squid (19.2.x), and
+Tentacle (20.2.x) series.
 
 File naming format: `{rados,osd}-<version>_dwarf.json`
 - Example: `rados-2:19.2.3-0.el9_dwarf.json`
 - Example: `osd-2:19.2.3-0.el9_dwarf.json`
+
+### Debian
+
+Location: `files/debian/{radostrace,osdtrace}/`
+
+Covers the Debian-packaged Ceph releases (e.g. 18.2.7+ds-1 on trixie).
 
 > To check available DWARF files, browse the repository:
 > - [Ubuntu radostrace files](https://github.com/taodd/cephtrace/tree/main/files/ubuntu/radostrace)
 > - [Ubuntu osdtrace files](https://github.com/taodd/cephtrace/tree/main/files/ubuntu/osdtrace)
 > - [CentOS Stream radostrace files](https://github.com/taodd/cephtrace/tree/main/files/centos-stream/radostrace)
 > - [CentOS Stream osdtrace files](https://github.com/taodd/cephtrace/tree/main/files/centos-stream/osdtrace)
+> - [Debian files](https://github.com/taodd/cephtrace/tree/main/files/debian)
 
 ## Generating DWARF JSON Files
 
@@ -111,6 +152,8 @@ sudo ./osdtrace -j osdtrace_dwarf.json
 
 The generated JSON file contains:
 - **Version information:** Package name and version string
+- **Architecture and build-ids:** Target architecture plus the ELF build-id of
+  each module (used to key the embedded-DWARF matching)
 - **Function addresses:** Locations of functions to probe
 - **Struct layouts:** Member offsets and sizes for Ceph internal structures
 - **Type information:** Data types and their properties
@@ -128,7 +171,7 @@ Use the `-i` flag to import a DWARF JSON file:
 sudo ./radostrace -i radostrace_dwarf.json
 
 # osdtrace with DWARF JSON
-sudo ./osdtrace -i osdtrace_dwarf.json -x
+sudo ./osdtrace -i osdtrace_dwarf.json
 ```
 
 ### Version Compatibility Checking
@@ -190,6 +233,6 @@ dwarf-files/
 ## See Also
 
 - [Getting Started Guide](getting-started.md) - Installation and basic usage
-- [radostrace Documentation](tools/radostrace.md) - Detailed radostrace usage
-- [osdtrace Documentation](tools/osdtrace.md) - Detailed osdtrace usage
-- [Containerized Ceph](deployment/containerized-ceph.md) - Using DWARF files with containers
+- [radostrace Documentation](radostrace.md) - Detailed radostrace usage
+- [osdtrace Documentation](osdtrace.md) - Detailed osdtrace usage
+- [Containerized Ceph](tracing-containerized-ceph.md) - Using DWARF files with containers

@@ -28,24 +28,47 @@ Run radostrace on machines acting as Ceph clients:
 
 ## Quick Start
 
-### With Pre-built Binary and DWARF File (Ubuntu)
+### With Pre-built Binary (Ubuntu)
+
+radostrace ships with DWARF data for many Ceph releases **compiled into the
+binary** (keyed by the `libceph-common.so.2` ELF build-id), so for covered
+versions no DWARF download or debug symbols are needed - including clients
+running in containers or snaps:
 
 ```bash
 # Download radostrace
 wget https://github.com/taodd/cephtrace/releases/latest/download/radostrace
 chmod +x radostrace
 
+# Discover the Ceph client processes on this host
+sudo ./radostrace --list
+#  PID        Container   Traceable   Ceph Version             Executable Path
+#  --------------------------------------------------------------------------------
+#  3134       yes         yes         17.2.9-0ubuntu0.22.04.2  /snap/lxd/.../qemu-system-x86_64
+#  5340       yes         yes         2:17.2.6-0.el8           /usr/bin/ceph-exporter
+
+# Trace one client (e.g. a VM's qemu process)
+sudo ./radostrace -p 3134
+```
+
+Use `./radostrace --list-embedded` to see all Ceph versions with compiled-in
+DWARF data. If your version is not embedded (`Traceable = no` in `--list`),
+fall back to a DWARF JSON file (`-i`) or debug symbols (below).
+
+### With a DWARF JSON File
+
+```bash
 # Check your librados version
 dpkg -l | grep librados
 
 # Download matching DWARF file
-wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/radostrace/17.2.6-0ubuntu0.22.04.2_dwarf.json
+wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/radostrace/17.2.9-0ubuntu0.22.04.3_dwarf.json
 
 # Start tracing all librados clients
-sudo ./radostrace -i 17.2.6-0ubuntu0.22.04.2_dwarf.json
+sudo ./radostrace -i 17.2.9-0ubuntu0.22.04.3_dwarf.json
 ```
 
-### With Debug Symbols Installed (When no mathcing DWARF json file)
+### With Debug Symbols Installed (when no matching DWARF JSON file)
 
 ```bash
 # Install debug symbols
@@ -57,18 +80,30 @@ sudo ./radostrace
 
 ## Command-Line Options
 
-### Basic Options
-
 ```
--p, --pid <PID>          Trace specific process ID only
--t, --time <seconds>     Run for specified duration then exit
--i, --import <file>      Import DWARF data from JSON file
--j, --json <file>        Export DWARF data to JSON file and exit
---skip-version-check     Skip version compatibility check when importing
--h, --help              Show help message
+-p, --pid <pid>            Attach uprobes only to the specified process ID
+                           (mandatory for container-based process tracing)
+-t, --timeout <seconds>    Run for specified duration then exit
+-i, --import-json <file>   Import DWARF data from JSON file
+-j, --export-json <file>   Export DWARF data to JSON (default:
+                           radostrace_dwarf.json) and exit
+-o, --output <file>        Also export captured events to CSV (default:
+                           radostrace_events.csv)
+--skip-version-check       Skip version compatibility check when importing
+--list                     List client processes using libceph-common (PID,
+                           container status, traceability, version) and exit
+--list-embedded            List Ceph versions with DWARF data compiled into
+                           this binary and exit
+-V, --version              Print version information and exit
+-h, --help                 Show help message
 ```
 
 ### Examples
+
+#### Discover client processes
+```bash
+sudo ./radostrace --list
+```
 
 #### Trace all librados clients
 ```bash
@@ -77,7 +112,7 @@ sudo ./radostrace
 
 #### Trace a specific process
 ```bash
-# Find the process ID for a VM
+# Find the process ID for a VM (or use --list)
 ps aux | grep qemu-system
 
 # Trace that specific VM
@@ -88,6 +123,11 @@ sudo ./radostrace -p 12345
 ```bash
 # Trace for 60 seconds then exit
 sudo ./radostrace -t 60
+```
+
+#### Export events to CSV while tracing
+```bash
+sudo ./radostrace -p 12345 -o events.csv
 ```
 
 #### Use DWARF JSON file
@@ -103,10 +143,15 @@ sudo ./radostrace -j radostrace_dwarf.json
 
 #### Trace containerized process
 ```bash
-# Find the process ID on the host
-ps aux | grep ceph-client
+# Discover containerized clients (Container column = yes)
+sudo ./radostrace --list
 
-# Skip version check for container mismatch
+# Embedded DWARF data is matched by the in-container library's build-id,
+# so for covered versions this just works:
+sudo ./radostrace -p 12345
+
+# For versions without embedded data, import a JSON matching the
+# *container's* Ceph version and skip the host version check:
 sudo ./radostrace -p 12345 -i dwarf.json --skip-version-check
 ```
 

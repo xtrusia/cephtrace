@@ -15,21 +15,33 @@ The fastest way to start tracing on Ubuntu is using pre-built binaries and DWARF
 
 ### Quick Start: radostrace
 
-Run on machines with Ceph clients (VMs with RBD volumes, OpenStack services, RGW gateways):
+Run on machines with Ceph clients (VMs with RBD volumes, OpenStack services, RGW gateways).
+DWARF data for many Ceph releases is **compiled into the binary**, so for covered versions
+you don't need DWARF files or debug symbols:
 
 ```bash
 # Download the binary
 wget https://github.com/taodd/cephtrace/releases/latest/download/radostrace
 chmod +x radostrace
 
+# Discover Ceph client processes (Traceable=yes means no extra setup needed)
+sudo ./radostrace --list
+
+# Start tracing a client (e.g. a VM's qemu process)
+sudo ./radostrace -p <PID>
+```
+
+If your version shows `Traceable = no`, download a matching DWARF file and pass it with `-i`:
+
+```bash
 # Check your Ceph version
 dpkg -l | grep librados
 
-# Download corresponding DWARF file (example for 17.2.6-0ubuntu0.22.04.2)
-wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/radostrace/17.2.6-0ubuntu0.22.04.2_dwarf.json
+# Download corresponding DWARF file (example for 17.2.9-0ubuntu0.22.04.3)
+wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/radostrace/17.2.9-0ubuntu0.22.04.3_dwarf.json
 
 # Start tracing
-sudo ./radostrace -i 17.2.6-0ubuntu0.22.04.2_dwarf.json
+sudo ./radostrace -i 17.2.9-0ubuntu0.22.04.3_dwarf.json
 ```
 
 ### Quick Start: osdtrace
@@ -41,14 +53,25 @@ Run on Ceph OSD nodes:
 wget https://github.com/taodd/cephtrace/releases/latest/download/osdtrace
 chmod +x osdtrace
 
+# Discover the OSDs on this host
+sudo ./osdtrace --list
+
+# Trace one OSD by ID, or all of them
+sudo ./osdtrace --id 0
+sudo ./osdtrace -a
+```
+
+If your version is not embedded (check with `--list-embedded`), use a DWARF file:
+
+```bash
 # Check your ceph-osd version
 dpkg -l | grep ceph-osd
 
 # Download corresponding DWARF file
-wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/osdtrace/17.2.6-0ubuntu0.22.04.2_dwarf.json
+wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/osdtrace/osd-17.2.9-0ubuntu0.22.04.3_dwarf.json
 
 # Start tracing
-sudo ./osdtrace -i 17.2.6-0ubuntu0.22.04.2_dwarf.json -x
+sudo ./osdtrace -i osd-17.2.9-0ubuntu0.22.04.3_dwarf.json
 ```
 
 ### Quick Start: kfstrace
@@ -91,7 +114,7 @@ git submodule update --init --recursive
 #### Debian/Ubuntu
 
 ```bash
-sudo apt-get install g++ clang libelf-dev libc6-dev libc6-dev-i386 libdw-dev
+sudo apt-get install g++ clang libelf-dev libc6-dev libc6-dev-i386 libdw-dev libssl-dev make
 ```
 
 #### RHEL/CentOS/Rocky Linux
@@ -151,7 +174,7 @@ sudo apt-get install ceph-osd-dbgsym
 ### Supported Architectures
 
 - x86_64 (AMD64)
-- Currently focused on x86_64; other architectures may require modifications
+- ARM64 (AArch64)
 
 ### Ceph Versions
 
@@ -161,6 +184,7 @@ Cephtrace has been tested with:
 - Ceph Quincy (17.x)
 - Ceph Reef (18.x)
 - Ceph Squid (19.x)
+- Ceph Tentacle (20.x)
 
 > While newer Ceph versions should work, you may need to generate DWARF JSON files for your specific version. See [DWARF JSON Files](dwarf-json-files.md) for details.
 
@@ -168,7 +192,7 @@ Cephtrace has been tested with:
 
 ## Next Steps
 
-- **Learn about each tool:** [radostrace](tools/radostrace.md) | [osdtrace](tools/osdtrace.md) | [kfstrace](tools/kfstrace.md)
+- **Learn about each tool:** [radostrace](radostrace.md) | [osdtrace](osdtrace.md) | [kfstrace](kfstrace.md)
 - **DWARF JSON files:** [Generation and usage guide](dwarf-json-files.md)
-- **Deployment scenarios:** [Containerized Ceph](deployment/containerized-ceph.md) | [Production best practices](deployment/production-best-practices.md)
-- **Development:** [Building](development/building.md) | [Architecture](development/architecture.md) | [Contributing](development/contributing.md)
+- **Deployment scenarios:** [Containerized Ceph](tracing-containerized-ceph.md) | [MicroCeph](tracing-microceph-snap.md)
+- **Development:** [Building](building.md) | [Architecture](architecture.md)
