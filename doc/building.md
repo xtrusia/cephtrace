@@ -39,5 +39,5 @@ git clone https://github.com/taodd/cephtrace
 cd cephtrace
 git submodule update --init --recursive
 make or
-make radostrace/make osdtrace
+make radostrace; make osdtrace
 ```
