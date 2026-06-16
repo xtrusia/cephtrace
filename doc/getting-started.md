@@ -174,7 +174,6 @@ sudo apt-get install ceph-osd-dbgsym
 ### Supported Architectures
 
 - x86_64 (AMD64)
-- ARM64 (AArch64)
 
 ### Ceph Versions
 
