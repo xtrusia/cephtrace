@@ -72,7 +72,7 @@ wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/osdtrac
 sudo ./osdtrace -i osd-17.2.9-0ubuntu0.22.04.3_dwarf.json
 ```
 
-### With Debug Symbols Installed
+### With Debug Symbols Installed (when no matching DWARF JSON file)
 
 ```bash
 # Install debug symbols
