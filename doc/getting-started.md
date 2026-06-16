@@ -25,9 +25,15 @@ chmod +x radostrace
 # Discover Ceph client processes (Traceable=yes means no extra setup needed)
 sudo ./radostrace --list
 
-# Start tracing a client (e.g. a VM's qemu process)
+# Trace one client by PID (e.g. a VM's qemu process)
 sudo ./radostrace -p <PID>
+
+# Or trace all detected client processes at once
+sudo ./radostrace
 ```
+
+> `-p` is mandatory when the client runs inside a container - see
+> [Tracing Containerized Ceph](tracing-containerized-ceph.md).
 
 If your version shows `Traceable = no`, download a matching DWARF file and pass it with `-i`:
 
@@ -95,6 +101,33 @@ sudo ./kfstrace -m all
 
 ---
 
+## Debug Symbols (Alternative to DWARF Files)
+
+If your Ceph version has neither embedded DWARF data compiled into the binary
+(check with `--list-embedded`) nor a pre-generated DWARF JSON file, you can
+install debug symbols on the machine where you'll run the tools instead. Once
+the debug symbols are installed, the tool parses them on the fly at startup -
+no extra flags or DWARF JSON file are needed.
+
+### Ubuntu Debug Symbols
+
+#### For radostrace:
+```bash
+sudo apt-get install librbd1-dbgsym librados2-dbgsym
+```
+
+#### For osdtrace:
+```bash
+sudo apt-get install ceph-osd-dbgsym
+```
+
+#### For kfstrace:
+**No debug symbols required** - kfstrace uses kernel probes and doesn't need DWARF information.
+
+> For more information on installing debug symbols on Ubuntu, see [Getting dbgsym Packages](https://ubuntu.com/server/docs/debug-symbol-packages#getting-dbgsymddeb-packages).
+
+---
+
 ## Building from Source
 
 For non-Ubuntu systems or if you want to build from source:
@@ -139,27 +172,6 @@ make
 ```
 
 This will build all three tools: `radostrace`, `osdtrace`, and `kfstrace`.
-
-## Debug Symbols (Alternative to DWARF Files)
-
-If you don't have pre-generated DWARF JSON files for your Ceph version, you can install debug symbols on the machine where you'll run the tools.
-
-### Ubuntu Debug Symbols
-
-#### For radostrace:
-```bash
-sudo apt-get install librbd1-dbgsym librados2-dbgsym
-```
-
-#### For osdtrace:
-```bash
-sudo apt-get install ceph-osd-dbgsym
-```
-
-#### For kfstrace:
-**No debug symbols required** - kfstrace uses kernel probes and doesn't need DWARF information.
-
-> For more information on installing debug symbols on Ubuntu, see [Getting dbgsym Packages](https://ubuntu.com/server/docs/debug-symbol-packages#getting-dbgsymddeb-packages).
 
 ---
 
