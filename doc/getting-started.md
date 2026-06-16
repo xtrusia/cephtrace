@@ -8,7 +8,7 @@ The fastest way to start tracing on Ubuntu is using pre-built binaries and DWARF
 
 ### Prerequisites
 
-- Ubuntu 20.04, 22.04, or 24.04
+- Ubuntu 20.04 or higher
 - Kernel version 5.8 or higher
 - Sudo/root access
 - A running Ceph cluster
@@ -16,8 +16,6 @@ The fastest way to start tracing on Ubuntu is using pre-built binaries and DWARF
 ### Quick Start: radostrace
 
 Run on machines with Ceph clients (VMs with RBD volumes, OpenStack services, RGW gateways).
-DWARF data for many Ceph releases is **compiled into the binary**, so for covered versions
-you don't need DWARF files or debug symbols:
 
 ```bash
 # Download the binary
