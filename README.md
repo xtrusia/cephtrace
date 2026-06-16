@@ -19,12 +19,12 @@ Cephtrace is a suite of **eBPF-based dynamic tracing tools** that provide **micr
 
 ### ✨ Key Features
 
-- **📊 Per-IO Latency Breakdown** - See exactly where each operation spends its time
-- **🔄 No Downtime Required** - Attach and detach from running processes dynamically
-- **⚙️  No Configuration Needed** - Just start tracing on the fly, no service restarts or config changes
-- **🔋 Batteries Included** - DWARF data for many Ceph releases is compiled into the binaries and matched by ELF build-id; use `--list` to discover traceable processes and `--list-embedded` to see covered versions
-- **📦 Works with Containers** - Full support for cephadm, Rook, Docker, lxd and MicroCeph
-- **🚀 Low Overhead in Production** - eBPF with the kernel uprobe dynamic instrumentation
+- ** Per-IO Latency Breakdown** - See exactly where each operation spends its time
+- ** No Downtime Required** - Attach and detach from running processes dynamically
+- ** No Configuration Needed** - Just start tracing on the fly, no service restarts or config changes
+- ** No Debug symbol Needed** - With embedded dwarf feature, no need to download debug packages.
+- ** Works with Containers** - Full support for cephadm, Rook, Docker, lxd and MicroCeph
+- ** Low Overhead in Production** - eBPF with the kernel uprobe dynamic instrumentation
 
 ## 🛠️ The Tools
 
