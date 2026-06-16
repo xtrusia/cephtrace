@@ -41,27 +41,34 @@ cephadm is the recommended Ceph deployment tool that uses containers (typically 
 #### Find Client Processes (for radostrace)
 
 ```bash
-# Find RGW process on host
-ps aux | grep radosgw
+# List Ceph client processes (host PID, container status, traceability, version)
+sudo ./radostrace --list
 
 # Example output:
-# root  12345  ... /usr/bin/radosgw -f --cluster ceph ...
+#  PID        Container   Traceable   Ceph Version    Executable Path
+#  ---------------------------------------------------------------------
+#  12345      yes         yes         2:19.2.3-0.el9  /usr/bin/radosgw
 ```
 
-The PID shown (12345) is the host PID, which is what you'll use with radostrace.
+The PID shown (12345) is the host PID, which is what you'll pass with `-p`. The
+`Traceable` column tells you whether this radostrace already has matching
+embedded DWARF data - `yes` means you can trace directly with no DWARF file.
 
 #### Find OSD Processes (for osdtrace)
 
 ```bash
-# Find ceph-osd processes on host
-ps aux | grep ceph-osd
+# List ceph-osd processes with their OSD IDs (host PID, container, traceability)
+sudo ./osdtrace --list
 
 # Example output:
-# ceph  23456  ... /usr/bin/ceph-osd -f --cluster ceph --id 0 ...
-# ceph  23457  ... /usr/bin/ceph-osd -f --cluster ceph --id 1 ...
+#  PID        OSD ID     Container    Traceable   Ceph Version
+#  -----------------------------------------------------------------------
+#  23456      0          yes          yes         2:19.2.3-0.el9
+#  23457      1          yes          yes         2:19.2.3-0.el9
 ```
 
-Each OSD runs as a separate process with a unique PID.
+Each OSD runs as a separate process; trace it by OSD ID with `--id` or by host
+PID with `-p`.
 
 ### Determine Container's Ceph Version
 
@@ -77,6 +84,12 @@ cephadm shell -- dpkg -l | grep ceph # For Debian-based
 ### Tracing with CentOS Stream Containers
 
 CentOS Stream is common in cephadm deployments.
+
+> **Check coverage first.** Run `sudo ./radostrace --list` (or `sudo ./osdtrace
+> --list`). If the `Traceable` column shows `yes`, your container's Ceph version
+> is already embedded - skip the DWARF download below and trace directly with
+> `-p <HOST_PID>` (or `--id <OSD_ID>` for osdtrace). The manual DWARF flow below
+> is only needed when `Traceable = no`.
 
 #### radostrace for CentOS Stream
 
@@ -120,7 +133,8 @@ sudo ./osdtrace -i osd-2:19.2.3-0.el9_dwarf.json -p <HOST_PID> --skip-version-ch
 
 ### Tracing with Ubuntu Containers
 
-If using Ubuntu-based Ceph containers:
+If using Ubuntu-based Ceph containers (again, only needed when `--list` shows
+`Traceable = no`):
 
 ```bash
 # Determine container's Ubuntu Ceph version
@@ -134,7 +148,7 @@ sudo ./radostrace -i 17.2.6-0ubuntu0.22.04.2_dwarf.json -p <HOST_PID> --skip-ver
 ```
 
 ## k8s/rook Deployments
-The steps are same with the tracing the cephadm deployed cluster.
+The steps are the same as tracing a cephadm-deployed cluster.
 
 ## Generating DWARF Files for Containers
 
