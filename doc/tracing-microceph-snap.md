@@ -1,158 +1,141 @@
 # Tracing MicroCeph Snap-based Deployments
 
-MicroCeph deploys Ceph using snap packages, which provides a self-contained Ceph deployment. The tracing process is similar to containerized Ceph, with some snap-specific considerations.
+MicroCeph deploys Ceph as a self-contained snap package. The cephtrace binary
+runs on the host while the target process runs inside the snap's confinement.
+cephtrace resolves the libraries a snap-confined process actually loaded from
+`/proc/<pid>/maps` (e.g. `/snap/microceph/<rev>/lib/...`, or LXD's qemu under
+`/snap/lxd/<rev>/...`), so the only thing that determines the workflow is
+whether the snap's Ceph version has **embedded DWARF data**.
 
-## Overview
+**Key points:**
+- The binary runs on the host; the traced process runs inside the snap.
+- DWARF data must match the *snap's* Ceph version, not the host's.
+- If the version is embedded (Part 1), there is nothing to download or
+  configure. If it is not (Part 2), supply a matching DWARF file and skip the
+  host version check.
 
-**Key Points:**
-- Tracing process is similar to containerized Ceph deployments
-- Binary runs on host, traced process runs inside snap namespace
-- DWARF data must match the snap's Ceph version, not the host's
+---
 
-**The easy path (v1.6+): embedded DWARF data.** The tools resolve the
-libraries a snap-confined process actually loaded from `/proc/<pid>/maps`
-(e.g. `/snap/microceph/<rev>/lib/...` or LXD's qemu under `/snap/lxd/<rev>/...`)
-and match the embedded DWARF data by ELF build-id. For covered versions no
-manifest lookup, DWARF download, or `--skip-version-check` is needed:
+## Part 1: Default - Embedded DWARF (no setup)
+
+cephtrace ships with DWARF data for many common Ceph releases compiled into the
+binary, matched by the ELF build-id of the library the snap process loaded. For
+covered versions no manifest lookup, DWARF download, or `--skip-version-check`
+is needed.
+
+### 1. Discover processes and check coverage
+
+`--list` shows each process's host PID, snap/container status, Ceph version, and
+a `Traceable` column - `yes` means embedded DWARF data already covers this
+version.
 
 ```bash
-# Discover snap-confined clients / OSDs and check coverage (Traceable column)
+# Clients (radosgw, qemu, ...)
 sudo ./radostrace --list
+
+# ceph-osd processes, with their OSD IDs
 sudo ./osdtrace --list
+```
 
-# Trace directly
+Use `--list-embedded` to see every Ceph version with compiled-in DWARF data.
+
+### 2. Trace directly
+
+Use the host PID (and, for OSDs, the OSD ID) reported by `--list`:
+
+```bash
+# Client process - -p is mandatory for snap-confined tracing
 sudo ./radostrace -p <HOST_PID>
+
+# OSD - by OSD ID, by host PID, or every traceable OSD on the host
 sudo ./osdtrace --id <OSD_ID>
+sudo ./osdtrace -p <HOST_PID>
+sudo ./osdtrace -a
 ```
 
-The rest of this guide covers the manual DWARF-file flow, needed only when the
-snap's Ceph version is not embedded (check with `--list-embedded`):
-- Use `--skip-version-check` flag
-- Specify exact process ID with `-p`
-- Generate or download DWARF files matching snap's Ceph version
-- **Critical:** Use snap manifest to determine exact Ceph package version
+If the `Traceable` column shows `yes`, you are done - skip Part 2 entirely.
 
-## Determining Snap's Ceph Version
+---
 
-The snap contains specific package versions that may differ from what's on your host.
+## Part 2: Non-embedded versions (manual DWARF data)
 
-### Check Snap Manifest
+When `--list` shows `Traceable = no` (the snap's Ceph version isn't in
+`--list-embedded`), supply DWARF data matching the *snap's* Ceph version and
+trace a specific PID with `--skip-version-check`.
 
-```bash
-# View the snap manifest to see all package versions
-cat /snap/microceph/current/snap/manifest.yaml
+### 1. Determine the snap's Ceph version
 
-# Filter for specific Ceph library versions
-cat /snap/microceph/current/snap/manifest.yaml | grep librados2
-
-# Example output:
-# librados2: 17.2.6-0ubuntu0.22.04.3
-
-# You can also check other Ceph packages
-cat /snap/microceph/current/snap/manifest.yaml | grep ceph-osd
-```
-The version string (e.g., `17.2.6-0ubuntu0.22.04.3`) is what you need for downloading or generating the correct DWARF files.
-
-## Identifying process ID
-
-### Find Client Processes (for radostrace)
-
-Take radosgw for example:
+The snap bundles specific package versions that may differ from the host. Read
+them from the snap manifest:
 
 ```bash
-# Find processes using radosgw
-ps aux | grep radosgw
+# librados version (for radostrace)
+grep librados2 /snap/microceph/current/snap/manifest.yaml
+# Example: librados2: 17.2.6-0ubuntu0.22.04.3
+
+# ceph-osd version (for osdtrace)
+grep ceph-osd /snap/microceph/current/snap/manifest.yaml
 ```
 
-### Find OSD Processes (for osdtrace)
+The version string (e.g. `17.2.6-0ubuntu0.22.04.3`) is what selects the correct
+DWARF file.
+
+### 2. Get a DWARF file matching that version
+
+Pre-generated files live in the repo under `files/ubuntu/<tool>/`, named by the
+snap's Ceph package version:
 
 ```bash
-# Find ceph-osd processes on host
-ps aux | grep ceph-osd
-```
-
-The PID shown is the host PID, which is what you'll use with osdtrace.
-
-## Tracing MicroCeph
-
-### radostrace for MicroCeph
-
-```bash
-# 1. Determine the exact librados version from snap manifest
-cat /snap/microceph/current/snap/manifest.yaml | grep librados2
-# Output: librados2: 17.2.6-0ubuntu0.22.04.3
-
-# 2. Download radostrace binary
-wget https://github.com/taodd/cephtrace/releases/latest/download/radostrace
-chmod +x radostrace
-
-# 3. Download DWARF file matching the snap's librados version
-# Example for version 17.2.6-0ubuntu0.22.04.3
+# radostrace (librados2 version)
 wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/radostrace/17.2.6-0ubuntu0.22.04.3_dwarf.json
 
-# 4. Find the client process PID on the host
-ps aux | grep <your_client_process>
-
-# 5. Trace with --skip-version-check
-sudo ./radostrace -i 17.2.6-0ubuntu0.22.04.3_dwarf.json -p <HOST_PID> --skip-version-check
+# osdtrace (ceph-osd version)
+wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/osdtrace/osd-17.2.6-0ubuntu0.22.04.3_dwarf.json
 ```
 
-**Why skip version check?**
-- The tool checks the host's library version
-- Snap has different library version in its isolated environment
-- Version check would fail even though DWARF file is correct for the snap
+If no matching file exists, generate one (see [Generating DWARF data](#generating-dwarf-data) below).
 
-### osdtrace for MicroCeph
+### 3. Trace with --skip-version-check
 
 ```bash
-# 1. Determine the exact ceph-osd version from snap manifest
-cat /snap/microceph/current/snap/manifest.yaml | grep ceph-osd
-# Output: ceph-osd: 17.2.6-0ubuntu0.22.04.3
+# Client
+sudo ./radostrace -i 17.2.6-0ubuntu0.22.04.3_dwarf.json -p <HOST_PID> --skip-version-check
 
-# 2. Download osdtrace binary
-wget https://github.com/taodd/cephtrace/releases/latest/download/osdtrace
-chmod +x osdtrace
-
-# 3. Download DWARF file matching the snap's ceph-osd version
-wget https://raw.githubusercontent.com/taodd/cephtrace/main/files/ubuntu/osdtrace/osd-17.2.6-0ubuntu0.22.04.3_dwarf.json
-
-# 4. Find the ceph-osd process PID on the host
-ps aux | grep ceph-osd
-
-# 5. Trace with --skip-version-check
+# OSD
 sudo ./osdtrace -i osd-17.2.6-0ubuntu0.22.04.3_dwarf.json -p <HOST_PID> --skip-version-check
 ```
 
-## Generating DWARF Files for MicroCeph
+**Why `--skip-version-check`?** The tool compares against the host's library
+version, which differs from the version isolated inside the snap. The check
+would otherwise fail even though the DWARF file is correct for the snap, so it
+must be skipped.
 
-If pre-generated DWARF files aren't available for your snap's Ceph version:
+### Generating DWARF data
 
-### Method 1: Generate on Matching Ubuntu System
+If no pre-generated DWARF file exists for your snap's Ceph version, build one on
+an Ubuntu system matching the snap's base and Ceph version (from the manifest):
 
 ```bash
-# Set up Ubuntu system matching your snap's base (e.g., Ubuntu 22.04)
-# Install the exact Ceph version from snap manifest
-sudo apt-get install ceph-osd=17.2.6-0ubuntu0.22.04.3
-sudo apt-get install ceph-osd-dbgsym=17.2.6-0ubuntu0.22.04.3
+# Install the exact Ceph version and its debug symbols
+sudo apt-get install ceph-osd=17.2.6-0ubuntu0.22.04.3 \
+                     ceph-osd-dbgsym=17.2.6-0ubuntu0.22.04.3
 
-# Download cephtrace
-wget https://github.com/taodd/cephtrace/releases/latest/download/osdtrace
-chmod +x osdtrace
-
-# Generate DWARF file
-sudo ./osdtrace -j osd_17.2.6-0ubuntu0.22.04.3_dwarf.json
-
-# Copy DWARF file to your MicroCeph host
+# Export the DWARF JSON
+sudo ./osdtrace -j osd-17.2.6-0ubuntu0.22.04.3_dwarf.json
 ```
+
+Copy the JSON to your MicroCeph host and use it with `--skip-version-check`. See
+[DWARF JSON Files](dwarf-json-files.md) for more detail.
+
+---
 
 ## kfstrace with MicroCeph
 
-**Good news:** kfstrace works normally with MicroCeph!
-
-**Why?** kfstrace traces the kernel module (`ceph.ko`), not the snap processes. The kernel module runs on the host, so there's no snap complexity.
+**kfstrace works normally with MicroCeph - no special steps.** It traces the
+kernel module (`ceph.ko`), which runs on the host rather than inside the snap,
+so none of the above snap complexity applies.
 
 ```bash
-# Download and run kfstrace normally
 wget https://github.com/taodd/cephtrace/releases/latest/download/kfstrace
 chmod +x kfstrace
 sudo ./kfstrace
