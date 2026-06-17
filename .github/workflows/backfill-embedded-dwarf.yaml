@@ -1,0 +1,22 @@
+name: Backfill embedded DWARF for historical Ceph releases
+
+# Manual caller: generates + runtime-verifies DWARF JSONs for the FULL set of
+# missing versions (including historical point releases below each major's
+# current ceiling), then opens a PR with the verified subset.  Run this on
+# demand from the Actions tab to fill historical gaps; the scheduled
+# refresh-embedded-dwarf.yaml only handles freshly-published releases.
+#
+# Same engine as the scheduled refresh, just without the --new-only filter.
+
+on:
+  workflow_dispatch:    # manual only -- backfill is intentionally not scheduled
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  backfill:
+    uses: ./.github/workflows/embedded-dwarf-refresh-reusable.yaml
+    with:
+      new_only: false

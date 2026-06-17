@@ -18,6 +18,7 @@ package-version-string (matches what `osdtrace -j` records as the JSON's
 
 from __future__ import annotations
 
+import argparse
 import sys
 import urllib.request
 from pathlib import Path
@@ -91,8 +92,48 @@ def version_key(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in v.split("."))
 
 
+def covered_ceiling(
+    osd_have: set[str], rados_have: set[str]
+) -> dict[int, int]:
+    """Highest *fully covered* patch (both tools present) per major.
+
+    "Fully covered" = a version we ship JSONs for in BOTH osdtrace and
+    radostrace.  A major absent from the result has no fully-covered version
+    at all (a brand-new line, or one we've never backfilled).
+    """
+    ceiling: dict[int, int] = {}
+    for ver in osd_have & rados_have:
+        try:
+            major, _minor, patch = (int(x) for x in ver.split("."))
+        except ValueError:
+            continue
+        ceiling[major] = max(ceiling.get(major, -1), patch)
+    return ceiling
+
+
+def is_new_release(ver: str, ceiling: dict[int, int]) -> bool:
+    """True when ver is a point release *newer* than our ceiling for its major.
+
+    Used by --new-only to pick up only freshly-published point releases on
+    lines we already maintain.  A major with no fully-covered version (not in
+    ``ceiling``) is treated as historical/backlog and left to the backfill
+    workflow, so this never auto-grabs an entire uncovered line.
+    """
+    major, _minor, patch = (int(x) for x in ver.split("."))
+    return major in ceiling and patch > ceiling[major]
+
+
 def main() -> None:
     """Probe upstream, diff against shipped JSONs, print missing TSV rows."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--new-only",
+        action="store_true",
+        help="emit only point releases newer than the highest fully-covered "
+             "patch of each major (skip historical gaps and uncovered lines)",
+    )
+    args = parser.parse_args()
+
     upstream = upstream_el9_versions()
     if not upstream:
         # Treat a fully-empty probe set as a hard error: it almost always
@@ -105,10 +146,17 @@ def main() -> None:
     osd_have = existing_versions("osdtrace")
     rados_have = existing_versions("radostrace")
 
+    # --new-only: restrict to point releases above each major's fully-covered
+    # ceiling, so the scheduled bot picks up only freshly-published releases
+    # and leaves the historical backlog to the backfill workflow.
+    ceiling = covered_ceiling(osd_have, rados_have) if args.new_only else {}
+
     # Group missing-tool sets by version so one container session can
     # generate both JSONs for the same version.
     missing: dict[str, list[str]] = {}
     for ver in upstream:
+        if args.new_only and not is_new_release(ver, ceiling):
+            continue
         tools: list[str] = []
         if ver not in osd_have:
             tools.append("osdtrace")
