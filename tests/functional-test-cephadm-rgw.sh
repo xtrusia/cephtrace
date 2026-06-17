@@ -263,14 +263,17 @@ info "=== Step 10b: verify --list output over a multi-client host ==="
 # a native client (Container=no, version = the host package).
 apt-get install -y -q ceph-common
 
-# quincy=17 reef=18 squid=19 tentacle=20: the containerized rows must all
-# report a version of this major.
+# The argument is a release name from PR CI (quincy/reef/squid/tentacle) but a
+# bare version number from the embedded-DWARF refresh bot (e.g. "20.2.2", with
+# CEPH_IMAGE pinned).  Map either form to the expected Ceph major - the
+# containerized rows must all report a version of this major.
 case "$CEPH_RELEASE" in
     quincy)   EXPECTED_MAJOR=17 ;;
     reef)     EXPECTED_MAJOR=18 ;;
     squid)    EXPECTED_MAJOR=19 ;;
     tentacle) EXPECTED_MAJOR=20 ;;
-    *) err "unknown release $CEPH_RELEASE"; exit 1 ;;
+    [0-9]*)   EXPECTED_MAJOR=$(_version_major "$CEPH_RELEASE") ;;  # 20.2.2 -> 20
+    *) err "unknown release '$CEPH_RELEASE'"; exit 1 ;;
 esac
 
 cephadm shell --fsid "$FSID" -- ceph osd pool create list-test 8 >>"$WORKLOAD_LOG" 2>&1
