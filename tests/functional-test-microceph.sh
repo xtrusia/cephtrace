@@ -18,6 +18,8 @@ source "$SCRIPT_DIR/lib/log.sh"
 source "$SCRIPT_DIR/lib/microceph-setup.sh"
 # shellcheck source=lib/verify-trace-output.sh
 source "$SCRIPT_DIR/lib/verify-trace-output.sh"
+# shellcheck source=lib/verify-list-output.sh
+source "$SCRIPT_DIR/lib/verify-list-output.sh"
 
 echo "=== MicroCeph Functional Test for osdtrace and radostrace ==="
 echo "Project root: $PROJECT_ROOT"
@@ -156,6 +158,13 @@ if [ -z "$OSD_PID" ]; then
 fi
 info "Found OSD process: PID $OSD_PID"
 
+info "=== Step 4b: Verify osdtrace --list discovers the snap-confined OSDs ==="
+# MicroCeph deploys 3 OSDs (see microceph_setup_single_node call above), each
+# snap-confined.  --list must enumerate all three, mark them Container=yes
+# (snap mount ns), resolve a non-"unknown" traceability verdict through the
+# snap namespace, and - when traceable - report the snap's exact Ceph version.
+verify_osdtrace_list_microceph "$PROJECT_ROOT/osdtrace" 3 "$CEPH_VERSION"
+
 info "=== Step 5: Create RBD pool and image for testing ==="
 if ! microceph.ceph osd pool ls | grep -q "^test_pool$"; then
     microceph.ceph osd pool create test_pool 32
@@ -230,6 +239,14 @@ timeout 30 $PROJECT_ROOT/radostrace -p $RBD_ACTUAL_PID -i $RADOS_DWARF --skip-ve
 sleep 2 # ensure radostrace starts before we get its PID
 RADOSTRACE_PID=$(pidof radostrace)
 info "Started radostrace with PID $RADOSTRACE_PID"
+
+info "=== Step 8b: Verify radostrace --list while the snap client is live ==="
+# The rbd bench client is snap-confined and only exists during the bench, so
+# this check runs now (before the Step 9 wait).  --list must discover that
+# client (Container=yes, libraries resolved under /snap/microceph/...) and
+# also surface the snap ceph-mon/mgr/mds daemons, proving daemon discovery -
+# not just the transient bench process.
+verify_radostrace_list_microceph "$PROJECT_ROOT/radostrace" "$RBD_ACTUAL_PID" "$CEPH_VERSION"
 
 info "=== Step 9: Wait for bench + traces to complete"
 wait

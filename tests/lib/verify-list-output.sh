@@ -247,3 +247,147 @@ _verify_osdtrace_list_multiosd_impl() {
     info "✓ osdtrace --list multi-OSD output verified"
     return 0
 }
+
+# ---------------------------------------------------------------------------
+# MicroCeph (snap) variants.
+#
+# MicroCeph runs every daemon snap-confined: each process lives in the snap's
+# own mount namespace with its libraries under /snap/microceph/<rev>/...,
+# which is a different resolution path than podman/docker containers.  These
+# verifiers assert what --list must get right for that snap path:
+#   - Container = yes               (the snap mount ns differs from the host's)
+#   - Traceable != "unknown"        ("unknown" means the ELF build-id could not
+#                                     be read through /proc/<pid>/root, i.e. the
+#                                     snap-namespace resolution failed - the bug
+#                                     these guard)
+#   - version exact-match only when Traceable=yes, so a MicroCeph release that
+#     has moved ahead of the embedded DWARF set (Traceable=no) does not make
+#     the test flaky.
+# ---------------------------------------------------------------------------
+
+# verify_osdtrace_list_microceph <binary> <expected_count> <expected_version>
+verify_osdtrace_list_microceph() {
+    local _xtrace=0
+    case $- in *x*) _xtrace=1; set +x;; esac
+    _verify_osdtrace_list_microceph_impl "$@"
+    local rc=$?
+    (( _xtrace == 1 )) && set -x
+    return $rc
+}
+
+_verify_osdtrace_list_microceph_impl() {
+    local binary=$1 expected_count=$2 expected_version=$3
+    local total=0 fail=0
+    local pid osd_id container traceable version
+    local -A seen_pid seen_id
+
+    while IFS='|' read -r pid osd_id container traceable version; do
+        [ -z "$pid" ] && continue
+        total=$((total + 1))
+
+        [ -z "${seen_pid[$pid]:-}" ] || {
+            err "osdtrace --list: PID $pid listed more than once"; fail=1; }
+        seen_pid[$pid]=1
+        [ -z "${seen_id[$osd_id]:-}" ] || {
+            err "osdtrace --list: OSD ID $osd_id listed more than once"; fail=1; }
+        seen_id[$osd_id]=1
+
+        kill -0 "$pid" 2>/dev/null || {
+            err "osdtrace --list: PID $pid (osd.$osd_id) not a live process"
+            fail=1; }
+        [ "$container" = "yes" ] || {
+            err "osdtrace --list: osd.$osd_id (pid $pid) Container=$container, expected yes (snap)"
+            fail=1; }
+        [ "$traceable" != "unknown" ] || {
+            err "osdtrace --list: osd.$osd_id (pid $pid) Traceable=unknown - build-id read through the snap namespace failed"
+            fail=1; }
+        if [ "$traceable" = "yes" ] && [ "$version" != "$expected_version" ]; then
+            err "osdtrace --list: osd.$osd_id traceable but version '$version' != '$expected_version'"
+            fail=1
+        fi
+    done < <(_osdtrace_list_rows "$binary")
+
+    info "osdtrace --list (microceph): total=$total expected=$expected_count"
+
+    [ "$total" -eq "$expected_count" ] || {
+        err "osdtrace --list: $total rows, expected $expected_count"; fail=1; }
+
+    local live
+    for live in $(pgrep -x ceph-osd 2>/dev/null); do
+        [ -n "${seen_pid[$live]:-}" ] || {
+            err "osdtrace --list: live ceph-osd PID $live not listed"; fail=1; }
+    done
+
+    if [ "$fail" -ne 0 ]; then
+        "$binary" --list 2>&1 || true
+        return 1
+    fi
+    info "✓ osdtrace --list (microceph) verified"
+    return 0
+}
+
+# verify_radostrace_list_microceph <binary> <client_pid> <expected_version>
+#
+# Asserts the snap-confined librados client <client_pid> (an rbd process) is
+# discovered, and that --list also surfaces the snap ceph daemons (mon/mgr/
+# mds), proving daemon discovery - not just the bench client.
+verify_radostrace_list_microceph() {
+    local _xtrace=0
+    case $- in *x*) _xtrace=1; set +x;; esac
+    _verify_radostrace_list_microceph_impl "$@"
+    local rc=$?
+    (( _xtrace == 1 )) && set -x
+    return $rc
+}
+
+_verify_radostrace_list_microceph_impl() {
+    local binary=$1 client_pid=$2 expected_version=$3
+    local total=0 fail=0 saw_client=0 saw_daemon=0
+    local pid container traceable version path base
+    local -A seen_pid
+
+    while IFS='|' read -r pid container traceable version path; do
+        [ -z "$pid" ] && continue
+        total=$((total + 1))
+        [ -z "${seen_pid[$pid]:-}" ] || {
+            err "radostrace --list: PID $pid listed more than once"; fail=1; }
+        seen_pid[$pid]=1
+        base=${path##*/}
+
+        if [ "$pid" = "$client_pid" ]; then
+            saw_client=1
+            [ "$container" = "yes" ] || {
+                err "rbd client $pid: Container=$container, expected yes (snap)"
+                fail=1; }
+            case "$path" in
+                /snap/*) ;;
+                *) err "rbd client $pid: path '$path' not under /snap (snap lib resolution?)"
+                   fail=1;;
+            esac
+            [ "$traceable" != "unknown" ] || {
+                err "rbd client $pid: Traceable=unknown - snap-namespace build-id read failed"
+                fail=1; }
+            if [ "$traceable" = "yes" ] && [ "$version" != "$expected_version" ]; then
+                err "rbd client $pid: traceable but version '$version' != '$expected_version'"
+                fail=1
+            fi
+        fi
+        case "$base" in
+            ceph-mon|ceph-mgr|ceph-mds) saw_daemon=1 ;;
+        esac
+    done < <(_radostrace_list_rows "$binary")
+
+    info "radostrace --list (microceph): total=$total client=$saw_client daemons=$saw_daemon"
+
+    [ "$saw_client" -eq 1 ] || {
+        err "radostrace --list: snap rbd client pid $client_pid not listed"; fail=1; }
+    [ "$saw_daemon" -eq 1 ] || {
+        err "radostrace --list: no snap ceph-mon/mgr/mds daemon listed"; fail=1; }
+
+    if [ "$fail" -ne 0 ]; then
+        "$binary" --list 2>&1 || true
+        return 1
+    fi
+    info "✓ radostrace --list (microceph) verified"
+    return 0
+}
