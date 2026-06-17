@@ -8,9 +8,8 @@ name: Refresh embedded DWARF for new Ceph releases
 
 on:
   schedule:
-    # Weekly, Monday 06:00 UTC -- well after Ceph upstream's typical
-    # Friday/Tuesday point-release cadence.
-    - cron: '0 6 * * 1'
+    # Daily at 18:30 Japan time (JST = UTC+9, no DST) -> 09:30 UTC.
+    - cron: '30 9 * * *'
   workflow_dispatch:    # also runnable on demand from the Actions UI
 
 permissions:
