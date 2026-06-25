@@ -178,7 +178,7 @@ void DwarfParser::traverse_module(Dwfl_Module *mod, Dwarf *dw, bool want_type) {
     //cout << "preprocess_module cu name " << cu_name << endl;
     /* Skip partial units. */
     if (dwarf_tag(die) == DW_TAG_compile_unit) {
-       	iterate_types_in_cu(mcu, die);
+      iterate_types_in_cu(mcu, die);
     }
     off = noff;
   }
@@ -295,17 +295,17 @@ Dwarf_Die * DwarfParser::dwarf_attr_die(Dwarf_Die *die, unsigned int attr_flag, 
     {
       /* Get the actual DIE type*/
       if (attr_flag == DW_AT_type)
-	{
-	  Dwarf_Attribute sigm;
-	  Dwarf_Attribute *sig = dwarf_attr (result, DW_AT_signature, &sigm);
-	  if (sig != NULL)
-	    result = dwarf_formref_die (sig, result);
+        {
+          Dwarf_Attribute sigm;
+          Dwarf_Attribute *sig = dwarf_attr (result, DW_AT_signature, &sigm);
+          if (sig != NULL)
+            result = dwarf_formref_die (sig, result);
 
-	  /* A DW_AT_signature might point to a type_unit, then
-	     the actual type DIE we want is the first child.  */
-	  if (result != NULL && dwarf_tag (result) == DW_TAG_type_unit)
-	    dwarf_child (result, result);
-	}
+          /* A DW_AT_signature might point to a type_unit, then
+             the actual type DIE we want is the first child.  */
+          if (result != NULL && dwarf_tag (result) == DW_TAG_type_unit)
+            dwarf_child (result, result);
+        }
       return result;
     }
   return NULL;
@@ -343,14 +343,14 @@ bool DwarfParser::find_class_member(Dwarf_Die *vardie, Dwarf_Die *typedie,
         // TODO
       } else if (name == member) {
         *vardie = die;
-	found = true;
-	break;
+        found = true;
+        break;
       }
 
     } while (dwarf_siblingof(&die, &die) == 0);
     die_queue.pop();
     if (found)
-	break;
+      break;
   }
 
   if (!found) {
