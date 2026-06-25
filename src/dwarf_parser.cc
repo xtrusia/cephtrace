@@ -557,13 +557,8 @@ static int handle_function(Dwarf_Die *die, void *data) {
     string varname = arr[i][0];
     Dwarf_Die vardie, typedie;
     VarLocation varloc;
-    if (!dp->translate_param_location(die, varname, pc, vardie, varloc)) {
-      cerr << "Skip probe on " << fullname << ": parameter " << varname
-           << " unresolved" << endl;
-      func2pc.erase(fullname);
-      func2vf.erase(fullname);
-      return 0;
-    }
+    bool ok = dp->translate_param_location(die, varname, pc, vardie, varloc);
+    assert(ok);
     //printf("var %s location : register %d, offset %d, stack %d\n",
      //varname.c_str(), varloc.reg, varloc.offset, varloc.stack);
     vf[i].varloc = varloc;
@@ -571,13 +566,8 @@ static int handle_function(Dwarf_Die *die, void *data) {
     // translate fileds
     dp->dwarf_die_type(&vardie, &typedie);
     vf[i].fields.resize(arr[i].size());
-    if (!dp->translate_fields(&vardie, &typedie, pc, arr[i], vf[i].fields)) {
-      cerr << "Skip probe on " << fullname << ": field of parameter "
-           << varname << " unresolved" << endl;
-      func2pc.erase(fullname);
-      func2vf.erase(fullname);
-      return 0;
-    }
+    ok = dp->translate_fields(&vardie, &typedie, pc, arr[i], vf[i].fields);
+    assert(ok);
     for (int j = 1; j < (int)vf[i].fields.size(); ++j) {
        //printf("Field %s is at offset %d, defref %d\n", arr[i][j].c_str(),
        //vf[i].fields[j].offset, vf[i].fields[j].pointer);
@@ -588,10 +578,7 @@ static int handle_function(Dwarf_Die *die, void *data) {
 
 bool DwarfParser::translate_expr(Dwarf_Attribute *fb_attr, Dwarf_Op *expr,
                                  Dwarf_Addr pc, VarLocation &varloc) {
-  if (expr == NULL) {
-    cerr << "translate_expr: null location expression" << endl;
-    return false;
-  }
+  assert(expr != NULL);
   int atom = expr->atom;
 
   // TODO can put a debug message to print the atom's name in string
