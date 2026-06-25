@@ -178,7 +178,7 @@ void DwarfParser::traverse_module(Dwfl_Module *mod, Dwarf *dw, bool want_type) {
     //cout << "preprocess_module cu name " << cu_name << endl;
     /* Skip partial units. */
     if (dwarf_tag(die) == DW_TAG_compile_unit) {
-       	iterate_types_in_cu(mcu, die);
+      iterate_types_in_cu(mcu, die);
     }
     off = noff;
   }
@@ -200,12 +200,12 @@ void DwarfParser::traverse_module(Dwfl_Module *mod, Dwarf *dw, bool want_type) {
   }
 }
 
-Dwarf_Die DwarfParser::find_param(Dwarf_Die *func, string symbol) {
-  Dwarf_Die vardie;
-
-  dwarf_getscopevar(func, 1, symbol.c_str(), 0, NULL, 0, 0, &vardie);
-
-  return vardie;
+bool DwarfParser::find_param(Dwarf_Die *func, string symbol,
+                             Dwarf_Die &vardie) {
+  // dwarf_getscopevar: returns a non-negative scope index on success, -1 on
+  // error or -2 when no matching variable exists.  On failure it leaves
+  // vardie untouched, so the caller must not use it.
+  return dwarf_getscopevar(func, 1, symbol.c_str(), 0, NULL, 0, 0, &vardie) >= 0;
 }
 
 Dwarf_Attribute *DwarfParser::find_func_frame_base(
@@ -217,27 +217,31 @@ Dwarf_Attribute *DwarfParser::find_func_frame_base(
   return fb_attr;
 }
 
-VarLocation DwarfParser::translate_param_location(Dwarf_Die *func,
-                                                  string symbol, Dwarf_Addr pc,
-                                                  Dwarf_Die &vardie) {
-  vardie = find_param(func, symbol);
-  Dwarf_Attribute fb_attr_mem;
-  Dwarf_Attribute *fb_attr = find_func_frame_base(func, &fb_attr_mem);
+bool DwarfParser::translate_param_location(Dwarf_Die *func, string symbol,
+                                           Dwarf_Addr pc, Dwarf_Die &vardie,
+                                           VarLocation &varloc) {
+  if (!find_param(func, symbol, vardie)) {
+    cerr << "Couldn't find parameter " << symbol << endl;
+    return false;
+  }
 
-  // Assume the vardie must has a DW_AT_location
   Dwarf_Attribute loc_attr;
-  dwarf_attr_integrate(&vardie, DW_AT_location, &loc_attr);
+  if (dwarf_attr_integrate(&vardie, DW_AT_location, &loc_attr) == NULL) {
+    cerr << "Parameter " << symbol << " has no DW_AT_location" << endl;
+    return false;
+  }
 
   Dwarf_Op *expr;
   size_t len;
   int r = dwarf_getlocation_addr(&loc_attr, pc, &expr, &len, 1);
-  if (r != 1 || len <= 0) {
+  if (r != 1 || len == 0) {
     cerr << "Get param location expr failed for symbol " << symbol << endl;
+    return false;
   }
 
-  VarLocation varloc;
-  translate_expr(fb_attr, expr, pc, varloc);
-  return varloc;
+  Dwarf_Attribute fb_attr_mem;
+  Dwarf_Attribute *fb_attr = find_func_frame_base(func, &fb_attr_mem);
+  return translate_expr(fb_attr, expr, pc, varloc);
 }
 
 bool DwarfParser::find_prologue(Dwarf_Die *func, Dwarf_Addr &pc) {
@@ -291,36 +295,36 @@ Dwarf_Die * DwarfParser::dwarf_attr_die(Dwarf_Die *die, unsigned int attr_flag, 
     {
       /* Get the actual DIE type*/
       if (attr_flag == DW_AT_type)
-	{
-	  Dwarf_Attribute sigm;
-	  Dwarf_Attribute *sig = dwarf_attr (result, DW_AT_signature, &sigm);
-	  if (sig != NULL)
-	    result = dwarf_formref_die (sig, result);
+        {
+          Dwarf_Attribute sigm;
+          Dwarf_Attribute *sig = dwarf_attr (result, DW_AT_signature, &sigm);
+          if (sig != NULL)
+            result = dwarf_formref_die (sig, result);
 
-	  /* A DW_AT_signature might point to a type_unit, then
-	     the actual type DIE we want is the first child.  */
-	  if (result != NULL && dwarf_tag (result) == DW_TAG_type_unit)
-	    dwarf_child (result, result);
-	}
+          /* A DW_AT_signature might point to a type_unit, then
+             the actual type DIE we want is the first child.  */
+          if (result != NULL && dwarf_tag (result) == DW_TAG_type_unit)
+            dwarf_child (result, result);
+        }
       return result;
     }
   return NULL;
 }
 
-void DwarfParser::find_class_member(Dwarf_Die *vardie, Dwarf_Die *typedie,
+bool DwarfParser::find_class_member(Dwarf_Die *vardie, Dwarf_Die *typedie,
                                     string member, Dwarf_Attribute *attr) {
   // TODO deal with inheritance later
 
   std::queue<Dwarf_Die> die_queue;
   die_queue.push(*typedie);
+  bool found = false;
   while (!die_queue.empty()) {
-    bool found = false;
     Dwarf_Die die;
     int r = dwarf_child(&die_queue.front(), &die);
     if (r != 0) {
       cerr << "the class " << dwarf_diename(typedie)
-           << " has no children, unexpected and exit" << endl;
-      return;
+           << " has no children, unexpected; skipping" << endl;
+      return false;
     }
     do {
       int tag = dwarf_tag(&die);
@@ -339,24 +343,30 @@ void DwarfParser::find_class_member(Dwarf_Die *vardie, Dwarf_Die *typedie,
         // TODO
       } else if (name == member) {
         *vardie = die;
-	found = true;
-	break;
+        found = true;
+        break;
       }
 
     } while (dwarf_siblingof(&die, &die) == 0);
     die_queue.pop();
-    if (found) 
-	break;
+    if (found)
+      break;
   }
 
+  if (!found) {
+    cerr << "couldn't find member " << member << endl;
+    return false;
+  }
   if (dwarf_hasattr_integrate(vardie, DW_AT_data_member_location)) {
     dwarf_attr_integrate(vardie, DW_AT_data_member_location, attr);
-  } else if (dwarf_hasattr_integrate(vardie, DW_AT_data_bit_offset)) {
-    // TODO deal with bit member
+    return true;
   }
+  // DW_AT_data_bit_offset (bitfield) is not handled yet; report failure
+  // instead of leaving attr unset for the caller to dereference.
+  return false;
 }
 
-void DwarfParser::translate_fields(Dwarf_Die *vardie, Dwarf_Die *typedie,
+bool DwarfParser::translate_fields(Dwarf_Die *vardie, Dwarf_Die *typedie,
                                    Dwarf_Addr pc, vector<string> fields,
                                    vector<Field> &res) {
   int i = 1;
@@ -383,14 +393,15 @@ void DwarfParser::translate_fields(Dwarf_Die *vardie, Dwarf_Die *typedie,
         /* A pointer with no type is a void* -- can't dereference it. */
         if (!dwarf_hasattr_integrate(typedie, DW_AT_type)) {
           clog << "invalid access pointer " << fields[i] << endl;
-          return;
+          return false;
         }
         res[i].pointer = true;
         dwarf_die_type(typedie, typedie);
         break;
       case DW_TAG_array_type:
-        // TODO
-        break;
+        // TODO: array element access is not resolved yet
+        clog << "unsupported array access " << fields[i] << endl;
+        return false;
       case DW_TAG_structure_type:
       case DW_TAG_union_type:
       case DW_TAG_class_type: {
@@ -398,21 +409,27 @@ void DwarfParser::translate_fields(Dwarf_Die *vardie, Dwarf_Die *typedie,
           Dwarf_Die *tmpdie = resolve_typedecl(typedie);
           if (tmpdie == NULL) {
             clog << "couldn't resolve type at " << fields[i] << endl;
-            return;
+            return false;
           }
 
           *typedie = *tmpdie;
         }
         Dwarf_Attribute attr;
-        find_class_member(vardie, typedie, fields[i], &attr);
+        if (!find_class_member(vardie, typedie, fields[i], &attr)) {
+          clog << "failed to find member location for " << fields[i] << endl;
+          return false;
+        }
         Dwarf_Op *expr;
         size_t len;
-        if (dwarf_getlocation_addr(&attr, pc, &expr, &len, 1) != 1) {
+        if (dwarf_getlocation_addr(&attr, pc, &expr, &len, 1) != 1 || len == 0) {
           clog << "failed to get location of attr for " << fields[i] << endl;
-          return;
+          return false;
         }
         VarLocation varloc;
-        translate_expr(NULL, expr, pc, varloc);
+        if (!translate_expr(NULL, expr, pc, varloc)) {
+          clog << "failed to translate location of " << fields[i] << endl;
+          return false;
+        }
         res[i].offset = varloc.offset;
 
         dwarf_die_type(vardie, typedie);
@@ -421,12 +438,13 @@ void DwarfParser::translate_fields(Dwarf_Die *vardie, Dwarf_Die *typedie,
       case DW_TAG_enumeration_type:
       case DW_TAG_base_type:
         clog << "invalid access enum or base type " << fields[i] << endl;
-        break;
+        return false;
       default:
         clog << "unexpected type " << fields[i] << endl;
-        break;
+        return false;
     }
   }
+  return true;
 }
 
 bool DwarfParser::filter_func(string funcname) {
@@ -538,7 +556,9 @@ static int handle_function(Dwarf_Die *die, void *data) {
   for (int i = 0; i < (int)arr.size(); ++i) {
     string varname = arr[i][0];
     Dwarf_Die vardie, typedie;
-    VarLocation varloc = dp->translate_param_location(die, varname, pc, vardie);
+    VarLocation varloc;
+    bool ok = dp->translate_param_location(die, varname, pc, vardie, varloc);
+    assert(ok);
     //printf("var %s location : register %d, offset %d, stack %d\n",
      //varname.c_str(), varloc.reg, varloc.offset, varloc.stack);
     vf[i].varloc = varloc;
@@ -546,7 +566,8 @@ static int handle_function(Dwarf_Die *die, void *data) {
     // translate fileds
     dp->dwarf_die_type(&vardie, &typedie);
     vf[i].fields.resize(arr[i].size());
-    dp->translate_fields(&vardie, &typedie, pc, arr[i], vf[i].fields);
+    ok = dp->translate_fields(&vardie, &typedie, pc, arr[i], vf[i].fields);
+    assert(ok);
     for (int j = 1; j < (int)vf[i].fields.size(); ++j) {
        //printf("Field %s is at offset %d, defref %d\n", arr[i][j].c_str(),
        //vf[i].fields[j].offset, vf[i].fields[j].pointer);
@@ -555,8 +576,9 @@ static int handle_function(Dwarf_Die *die, void *data) {
   return 0;
 }
 
-void DwarfParser::translate_expr(Dwarf_Attribute *fb_attr, Dwarf_Op *expr,
+bool DwarfParser::translate_expr(Dwarf_Attribute *fb_attr, Dwarf_Op *expr,
                                  Dwarf_Addr pc, VarLocation &varloc) {
+  assert(expr != NULL);
   int atom = expr->atom;
 
   // TODO can put a debug message to print the atom's name in string
@@ -608,14 +630,19 @@ void DwarfParser::translate_expr(Dwarf_Attribute *fb_attr, Dwarf_Op *expr,
       break;
 
     case DW_OP_fbreg: {
+      if (fb_attr == NULL) {
+        cerr << "translate_expr: DW_OP_fbreg with no frame base" << endl;
+        return false;
+      }
       Dwarf_Op *fb_expr;
       size_t fb_exprlen;
       int res = dwarf_getlocation_addr(fb_attr, pc, &fb_expr, &fb_exprlen, 1);
-      if (res != 1) {
+      if (res != 1 || fb_exprlen == 0) {
         cerr << "translate_expr get fb_expr failed" << endl;
+        return false;
       }
 
-      translate_expr(fb_attr, fb_expr, pc, varloc);
+      if (!translate_expr(fb_attr, fb_expr, pc, varloc)) return false;
       varloc.offset += expr->number;
       varloc.stack = true;
     } break;
@@ -633,7 +660,7 @@ void DwarfParser::translate_expr(Dwarf_Attribute *fb_attr, Dwarf_Op *expr,
         }
       }
 
-      if (cfa_ops == NULL) {
+      if (cfa_ops == NULL && cfi_eh != NULL) {
         if (dwarf_cfi_addrframe(cfi_eh, pc, &frame) == 0) {
           dwarf_frame_cfa(frame, &cfa_ops, &cfa_nops);
         } else {
@@ -641,8 +668,13 @@ void DwarfParser::translate_expr(Dwarf_Attribute *fb_attr, Dwarf_Op *expr,
         }
       }
 
-      translate_expr(fb_attr, cfa_ops, pc, varloc);
-    } break;
+      if (cfa_ops == NULL) {
+        cerr << "translate_expr: could not resolve call frame CFA" << endl;
+        return false;
+      }
+
+      return translate_expr(fb_attr, cfa_ops, pc, varloc);
+    }
     case DW_OP_reg0 ... DW_OP_reg31:
       varloc.reg = expr->atom - DW_OP_reg0;
       break;
@@ -654,6 +686,7 @@ void DwarfParser::translate_expr(Dwarf_Attribute *fb_attr, Dwarf_Op *expr,
     default:
       break;
   }
+  return true;
 }
 
 Dwfl *DwarfParser::create_dwfl(int fd, const char *fname) {

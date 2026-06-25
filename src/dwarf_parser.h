@@ -70,20 +70,20 @@ class DwarfParser {
   const char *cache_type_prefix(Dwarf_Die *);
   int iterate_types_in_cu(mod_cu_type_cache_t &, Dwarf_Die *);
   void traverse_module(Dwfl_Module *, Dwarf *, bool);
-  Dwarf_Die find_param(Dwarf_Die *, std::string);
+  bool find_param(Dwarf_Die *, std::string, Dwarf_Die &);
   Dwarf_Attribute *find_func_frame_base(Dwarf_Die *, Dwarf_Attribute *);
-  VarLocation translate_param_location(Dwarf_Die *, std::string, Dwarf_Addr,
-                                       Dwarf_Die &);
+  bool translate_param_location(Dwarf_Die *, std::string, Dwarf_Addr,
+                                Dwarf_Die &, VarLocation &);
   bool func_entrypc(Dwarf_Die *, Dwarf_Addr *);
   bool find_prologue(Dwarf_Die *func, Dwarf_Addr &pc);
   void dwarf_die_type(Dwarf_Die *, Dwarf_Die *);
-  void find_class_member(Dwarf_Die *, Dwarf_Die *, std::string,
+  bool find_class_member(Dwarf_Die *, Dwarf_Die *, std::string,
                          Dwarf_Attribute *);
-  void translate_fields(Dwarf_Die *, Dwarf_Die *, Dwarf_Addr,
+  bool translate_fields(Dwarf_Die *, Dwarf_Die *, Dwarf_Addr,
                         std::vector<std::string>, std::vector<Field> &);
   bool filter_func(std::string);
   bool filter_cu(std::string);
-  void translate_expr(Dwarf_Attribute *, Dwarf_Op *, Dwarf_Addr, VarLocation &);
+  bool translate_expr(Dwarf_Attribute *, Dwarf_Op *, Dwarf_Addr, VarLocation &);
   Dwfl *create_dwfl(int, const char *);
   std::string special_inlined_function_scope(const char *);
   Dwarf_Die * dwarf_attr_die(Dwarf_Die*, unsigned int, Dwarf_Die*);
