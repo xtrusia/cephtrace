@@ -102,29 +102,55 @@ fi
 # Get the ceph version for reference file lookup
 matching_ref_version=$(dpkg -l | awk '$2=="ceph-common" {print $3}')
 
-# Reference filenames may carry an optional architecture suffix
-# (e.g. osd-19.2.3-0ubuntu0.24.04.3_arm64_dwarf.json) when the same
-# package version is checked in for more than one arch.  Glob and pick
-# the first match instead of hard-coding the filename.
+# Stable key of every per-module build-id in a dwarf JSON (sorted,
+# comma-joined; empty when the JSON carries no build-id).
+dwarf_build_id_key() {
+    ./tests/dwarf_build_id.py "$1"
+}
+
+# Pick the reference whose per-module build-ids match the generated JSON.
+# A version can ship as several binaries (arch, the 26.04 amd64v3 variant,
+# a rebuild), each with its own addresses, so the build-id -- not the
+# filename -- selects the right one.
 find_ref() {
-    local dir="$1" prefix="$2"
-    ls "${dir}/${prefix}${matching_ref_version}"*_dwarf.json 2>/dev/null | head -1
+    local dir="$1" prefix="$2" generated="$3" want cand
+    want=$(dwarf_build_id_key "$generated")
+    [ -n "$want" ] || return 0
+    for cand in "${dir}/${prefix}${matching_ref_version}"*_dwarf.json; do
+        [ -e "$cand" ] || continue
+        if [ "$(dwarf_build_id_key "$cand")" = "$want" ]; then
+            echo "$cand"
+            return 0
+        fi
+    done
+}
+
+# Compare a freshly generated JSON against its build-id-matched reference.
+compare_by_build_id() {
+    local label="$1" dir="$2" prefix="$3" generated="$4" ref
+    ref=$(find_ref "$dir" "$prefix" "$generated")
+    if [ -n "$ref" ]; then
+        echo "Comparing $label against reference $ref"
+        ./tests/compare_dwarf_json.py "$ref" "$generated"
+        echo "$label dwarf json comparison passed!"
+    else
+        echo "ERROR: no checked-in $label reference matches build-id" \
+             "$(dwarf_build_id_key "$generated") of the installed binary;" \
+             "generated JSON left at $generated" >&2
+        exit 1
+    fi
 }
 
 # Test osdtrace dwarf json generation
 echo "Testing osdtrace dwarf json generation..."
 osd_new_dwarf="generated-osd-dwarf.json"
 ./osdtrace -j $osd_new_dwarf
-osd_ref_file=$(find_ref ./files/ubuntu/osdtrace osd-)
-./tests/compare_dwarf_json.py $osd_ref_file $osd_new_dwarf
-echo "osdtrace dwarf json comparison passed!"
+compare_by_build_id osdtrace ./files/ubuntu/osdtrace osd- "$osd_new_dwarf"
 
 # Test radostrace dwarf json generation
 echo "Testing radostrace dwarf json generation..."
 rados_new_dwarf="generated-rados-dwarf.json"
 ./radostrace -j $rados_new_dwarf
-rados_ref_file=$(find_ref ./files/ubuntu/radostrace "")
-./tests/compare_dwarf_json.py $rados_ref_file $rados_new_dwarf
-echo "radostrace dwarf json comparison passed!"
+compare_by_build_id radostrace ./files/ubuntu/radostrace "" "$rados_new_dwarf"
 
 echo "All dwarf json comparisons passed successfully!"
