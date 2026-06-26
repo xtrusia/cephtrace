@@ -45,6 +45,55 @@ jobs:
       - name: Functional test - radostrace tracing a qemu VM on an RBD disk
         run: sudo ./tests/functional-test-qemu-rbd.sh
 
+  # 26.04 ships ceph-osd as baseline amd64 and an amd64v3 variant; the hosted
+  # runner opts the latter in by default.  Run dwarf-compare against each,
+  # forcing the variant via the apt config (the -o override does not work) and
+  # asserting the resolved .deb so a wrong variant fails loudly instead of
+  # comparing against the wrong reference.
+  dwarf-compare-ubuntu-2604:
+    name: build-ubuntu-cephadm (ubuntu-26.04, ${{ matrix.release }}, ${{ matrix.variant }})
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [tentacle]
+        variant: [baseline, amd64v3]
+    steps:
+      - name: Checkout code and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+            sudo apt-get update
+            sudo apt-get install -y g++ clang libelf-dev libc6-dev-i386 libdw-dev python3
+
+      - name: Run Makefile build
+        run: make -j all
+
+      - name: Select ceph architecture variant and assert
+        run: |
+            if [ "${{ matrix.variant }}" = amd64v3 ]; then
+                echo 'APT::Architecture-Variants "amd64v3";' | \
+                    sudo tee /etc/apt/apt.conf.d/99cephtrace-variant
+                expect=_amd64v3.deb
+            else
+                # Drop the runner image's amd64v3 opt-in -> baseline amd64.
+                sudo grep -rl 'Architecture-Variants' /etc/apt/ 2>/dev/null | \
+                    sudo xargs -r rm -f
+                expect=_amd64.deb
+            fi
+            sudo apt-get update
+            got=$(apt-get install --print-uris -y ceph-osd | \
+                  grep -oE '_amd64(v3)?\.deb' | head -1)
+            echo "variant=${{ matrix.variant }} expect=$expect got=$got"
+            [ "$got" = "$expect" ] || { echo "::error::ceph-osd resolved to $got, expected $expect for ${{ matrix.variant }}"; exit 1; }
+
+      - name: Unit test - verify dwarf output is consistent (${{ matrix.variant }})
+        run: ./tests/dwarf-compare.sh
+
   build-ubuntu-cephadm:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
