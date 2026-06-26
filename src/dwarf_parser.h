@@ -74,6 +74,11 @@ class DwarfParser {
   Dwarf_Attribute *find_func_frame_base(Dwarf_Die *, Dwarf_Attribute *);
   bool translate_param_location(Dwarf_Die *, std::string, Dwarf_Addr,
                                 Dwarf_Die &, VarLocation &);
+  bool recover_param_location_from_abi(Dwarf_Die *, std::string, Dwarf_Addr,
+                                       Dwarf_Die &, VarLocation &);
+  bool translate_data_member_location(Dwarf_Attribute *, Dwarf_Addr, int &);
+  bool current_module_is_x86_64();
+  bool lookup_function_symbol_pc(std::string, Dwarf_Addr &);
   bool func_entrypc(Dwarf_Die *, Dwarf_Addr *);
   bool find_prologue(Dwarf_Die *func, Dwarf_Addr &pc);
   void dwarf_die_type(Dwarf_Die *, Dwarf_Die *);

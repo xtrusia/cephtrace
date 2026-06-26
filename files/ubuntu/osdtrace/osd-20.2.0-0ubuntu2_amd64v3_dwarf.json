@@ -21,7 +21,8 @@
       "PrimaryLogPG::log_op_stats": 10142560,
       "ReplicatedBackend::do_repop_reply": 11072736,
       "ReplicatedBackend::generate_subop": 11047760,
-      "ReplicatedBackend::repop_commit": 11084096
+      "ReplicatedBackend::repop_commit": 11084096,
+      "ReplicatedBackend::submit_transaction": 11068640
     },
     "func2vf": {
       "BlueStore::_do_write": {
@@ -1284,6 +1285,48 @@
               },
               {
                 "offset": 24,
+                "pointer": false
+              }
+            ]
+          }
+        ]
+      },
+      "ReplicatedBackend::submit_transaction": {
+        "var_fields": [
+          {
+            "location": {
+              "reg": 7,
+              "offset": 48,
+              "stack": true
+            },
+            "fields": [
+              {
+                "offset": 0,
+                "pointer": false
+              },
+              {
+                "offset": 0,
+                "pointer": false
+              },
+              {
+                "offset": 8,
+                "pointer": false
+              }
+            ]
+          },
+          {
+            "location": {
+              "reg": 7,
+              "offset": 48,
+              "stack": true
+            },
+            "fields": [
+              {
+                "offset": 0,
+                "pointer": false
+              },
+              {
+                "offset": 16,
                 "pointer": false
               }
             ]

@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cstring>
 #include <ctime>
+#include <cxxabi.h>
 #include <iostream>
 #include <map>
 #include <set>
@@ -24,6 +25,8 @@ extern "C" {
 #include <elfutils/libdw.h>
 #include <elfutils/libdwfl.h>
 #include <fcntl.h>
+#include <gelf.h>
+#include <libelf.h>
 #include <unistd.h>
 #include <stdlib.h>
 }
@@ -34,6 +37,234 @@ extern "C" {
 #include "version_utils.h"
 
 using namespace std;
+
+static const int x86_64_dwarf_rsp = 7;
+static const int x86_64_integer_arg_regs[] = {5, 4, 1, 2, 8, 9};
+
+enum x86_64_abi_class {
+  X86_64_ABI_INTEGER,
+  X86_64_ABI_MEMORY,
+};
+
+struct x86_64_abi_param {
+  enum x86_64_abi_class cls;
+  int stack_size;
+};
+
+static int align_up(int value, int align) {
+  return (value + align - 1) & ~(align - 1);
+}
+
+static bool die_type(Dwarf_Die *die, Dwarf_Die &typedie) {
+  Dwarf_Attribute attr_mem;
+  Dwarf_Attribute *attr = dwarf_attr_integrate(die, DW_AT_type, &attr_mem);
+  return attr != NULL && dwarf_formref_die(attr, &typedie) != NULL;
+}
+
+static bool strip_type_modifiers(Dwarf_Die &die) {
+  while (true) {
+    switch (dwarf_tag(&die)) {
+      case DW_TAG_typedef:
+      case DW_TAG_const_type:
+      case DW_TAG_volatile_type:
+      case DW_TAG_restrict_type: {
+        Dwarf_Die referent;
+        if (!die_type(&die, referent)) return false;
+        die = referent;
+        break;
+      }
+      default:
+        return true;
+    }
+  }
+}
+
+static bool param_type(Dwarf_Die *param, Dwarf_Die &type,
+                       const char *want_name, bool &name_matched) {
+  if (!die_type(param, type)) return false;
+  name_matched = false;
+
+  while (true) {
+    const char *name = dwarf_diename(&type);
+    if (name != NULL && strcmp(name, want_name) == 0)
+      name_matched = true;
+
+    switch (dwarf_tag(&type)) {
+      case DW_TAG_typedef:
+      case DW_TAG_const_type:
+      case DW_TAG_volatile_type:
+      case DW_TAG_restrict_type: {
+        Dwarf_Die referent;
+        if (!die_type(&type, referent)) return false;
+        type = referent;
+        break;
+      }
+      default:
+        return true;
+    }
+  }
+}
+
+static bool data_member_offset(Dwarf_Die *member_die, int &offset) {
+  Dwarf_Attribute attr;
+  if (dwarf_attr_integrate(member_die, DW_AT_data_member_location, &attr) ==
+      NULL)
+    return false;
+
+  Dwarf_Word udata;
+  if (dwarf_formudata(&attr, &udata) == 0) {
+    offset = (int)udata;
+    return true;
+  }
+
+  Dwarf_Sword sdata;
+  if (dwarf_formsdata(&attr, &sdata) == 0) {
+    offset = (int)sdata;
+    return true;
+  }
+
+  return false;
+}
+
+static bool find_direct_member(Dwarf_Die *type, const char *want_name,
+                               Dwarf_Die &member_die, int &offset) {
+  Dwarf_Die child;
+  if (dwarf_child(type, &child) != 0) return false;
+
+  do {
+    if (dwarf_tag(&child) != DW_TAG_member)
+      continue;
+
+    const char *name = dwarf_diename(&child);
+    if (name == NULL || strcmp(name, want_name) != 0)
+      continue;
+
+    if (!data_member_offset(&child, offset))
+      return false;
+
+    member_die = child;
+    return true;
+  } while (dwarf_siblingof(&child, &child) == 0);
+
+  return false;
+}
+
+static bool osd_reqid_type_layout_ok(Dwarf_Die *type) {
+  int64_t bytes = dwarf_bytesize(type);
+  if (bytes != 32) return false;
+
+  Dwarf_Die name_member, tid_member;
+  int name_offset, tid_offset;
+  if (!find_direct_member(type, "name", name_member, name_offset) ||
+      name_offset != 0)
+    return false;
+  if (!find_direct_member(type, "tid", tid_member, tid_offset) ||
+      tid_offset != 16)
+    return false;
+
+  Dwarf_Die name_type;
+  if (!die_type(&name_member, name_type)) return false;
+  if (!strip_type_modifiers(name_type)) return false;
+
+  Dwarf_Die num_member;
+  int num_offset;
+  return find_direct_member(&name_type, "_num", num_member, num_offset) &&
+         num_offset == 8;
+}
+
+static bool classify_x86_64_abi_param(Dwarf_Die *param,
+                                      struct x86_64_abi_param &abi_param) {
+  Dwarf_Die type;
+  bool is_osd_reqid = false;
+  if (!param_type(param, type, "osd_reqid_t", is_osd_reqid)) return false;
+
+  switch (dwarf_tag(&type)) {
+    case DW_TAG_pointer_type:
+    case DW_TAG_reference_type:
+    case DW_TAG_rvalue_reference_type:
+      abi_param.cls = X86_64_ABI_INTEGER;
+      abi_param.stack_size = 8;
+      return true;
+
+    case DW_TAG_base_type:
+    case DW_TAG_enumeration_type: {
+      int64_t bytes = dwarf_bytesize(&type);
+      if (bytes <= 0 || bytes > 8) return false;
+      abi_param.cls = X86_64_ABI_INTEGER;
+      abi_param.stack_size = 8;
+      return true;
+    }
+
+    case DW_TAG_structure_type:
+    case DW_TAG_union_type:
+    case DW_TAG_class_type: {
+      int64_t bytes = dwarf_bytesize(&type);
+      if (bytes <= 0) return false;
+
+      // VarLocation can represent one base register or stack address only.
+      // Only recover Ceph's request id aggregate after proving the exact
+      // DWARF type and member layout used by osdtrace's JSON fields.
+      if (!is_osd_reqid || !osd_reqid_type_layout_ok(&type)) return false;
+
+      abi_param.cls = X86_64_ABI_MEMORY;
+      abi_param.stack_size = align_up((int)bytes, 8);
+      return true;
+    }
+
+    default:
+      return false;
+  }
+}
+
+static bool function_return_may_use_x86_64_memory_pointer(Dwarf_Die *func) {
+  Dwarf_Die type;
+  if (!die_type(func, type)) return false;
+  if (!strip_type_modifiers(type)) return true;
+
+  switch (dwarf_tag(&type)) {
+    case DW_TAG_pointer_type:
+    case DW_TAG_reference_type:
+    case DW_TAG_rvalue_reference_type:
+    case DW_TAG_base_type:
+    case DW_TAG_enumeration_type:
+      return false;
+
+    case DW_TAG_structure_type:
+    case DW_TAG_union_type:
+    case DW_TAG_class_type:
+      // Non-trivial C++ aggregate returns may be implemented with a hidden
+      // sret pointer.  DWARF type size alone is not enough to prove they do
+      // not shift the visible argument registers, so do not recover here.
+      return true;
+
+    default:
+      return true;
+  }
+}
+
+static string demangle_symbol(const char *name) {
+  int status = 0;
+  char *demangled = abi::__cxa_demangle(name, NULL, NULL, &status);
+  if (status == 0 && demangled != NULL) {
+    string result(demangled);
+    free(demangled);
+    return result;
+  }
+  free(demangled);
+  return name ?: "";
+}
+
+static string demangled_function_base(string name) {
+  const string thunk_prefix = "non-virtual thunk to ";
+  if (name.rfind(thunk_prefix, 0) == 0) return "";
+
+  size_t clone = name.find(" [clone ");
+  if (clone != string::npos) return "";
+
+  size_t paren = name.find('(');
+  if (paren != string::npos) name.resize(paren);
+  return name;
+}
 
 bool DwarfParser::die_has_loclist(Dwarf_Die *begin_die) {
   Dwarf_Die die;
@@ -205,7 +436,174 @@ bool DwarfParser::find_param(Dwarf_Die *func, string symbol,
   // dwarf_getscopevar: returns a non-negative scope index on success, -1 on
   // error or -2 when no matching variable exists.  On failure it leaves
   // vardie untouched, so the caller must not use it.
-  return dwarf_getscopevar(func, 1, symbol.c_str(), 0, NULL, 0, 0, &vardie) >= 0;
+  if (dwarf_getscopevar(func, 1, symbol.c_str(), 0, NULL, 0, 0, &vardie) >= 0)
+    return true;
+
+  // Some C++ debug info represents the implicit object parameter through
+  // DW_AT_object_pointer instead of a normal name lookup for "this".
+  if (symbol == "this") {
+    Dwarf_Attribute attr_mem;
+    Dwarf_Attribute *attr = dwarf_attr_integrate(func, DW_AT_object_pointer,
+                                                 &attr_mem);
+    if (attr != NULL && dwarf_formref_die(attr, &vardie) != NULL)
+      return true;
+  }
+
+  return false;
+}
+
+bool DwarfParser::current_module_is_x86_64() {
+  if (cur_mod == NULL) return false;
+
+  GElf_Addr bias = 0;
+  Elf *elf = dwfl_module_getelf(cur_mod, &bias);
+  if (elf == NULL) return false;
+
+  GElf_Ehdr ehdr;
+  if (gelf_getehdr(elf, &ehdr) == NULL) return false;
+
+  return ehdr.e_machine == EM_X86_64;
+}
+
+bool DwarfParser::lookup_function_symbol_pc(string fullname, Dwarf_Addr &pc) {
+  if (cur_mod == NULL) return false;
+
+  GElf_Addr bias = 0;
+  Elf *elf = dwfl_module_getelf(cur_mod, &bias);
+  if (elf == NULL) return false;
+
+  bool found = false;
+  Dwarf_Addr found_pc = 0;
+  Elf_Scn *scn = NULL;
+  while ((scn = elf_nextscn(elf, scn)) != NULL) {
+    GElf_Shdr shdr;
+    if (gelf_getshdr(scn, &shdr) == NULL) continue;
+    if (shdr.sh_type != SHT_SYMTAB && shdr.sh_type != SHT_DYNSYM)
+      continue;
+    if (shdr.sh_entsize == 0) continue;
+
+    Elf_Data *data = NULL;
+    while ((data = elf_getdata(scn, data)) != NULL) {
+      size_t symbols = data->d_size / shdr.sh_entsize;
+      for (size_t i = 0; i < symbols; ++i) {
+        GElf_Sym sym;
+        if (gelf_getsym(data, i, &sym) == NULL) continue;
+        if (GELF_ST_TYPE(sym.st_info) != STT_FUNC || sym.st_value == 0)
+          continue;
+
+        const char *raw_name = elf_strptr(elf, shdr.sh_link, sym.st_name);
+        if (raw_name == NULL) continue;
+
+        string demangled = demangle_symbol(raw_name);
+        string base = demangled_function_base(demangled);
+        if (raw_name != fullname && base != fullname) continue;
+
+        Dwarf_Addr sym_pc = sym.st_value + bias;
+        if (found && found_pc != sym_pc) {
+          cerr << "Ambiguous ELF symbols for function " << fullname << endl;
+          return false;
+        }
+
+        found = true;
+        found_pc = sym_pc;
+      }
+    }
+  }
+
+  if (!found) return false;
+
+  pc = found_pc;
+  cerr << "Recovered entry PC for " << fullname
+       << " from ELF symbol table: " << pc << endl;
+  return true;
+}
+
+bool DwarfParser::recover_param_location_from_abi(Dwarf_Die *func,
+                                                  string symbol,
+                                                  Dwarf_Addr pc,
+                                                  Dwarf_Die &vardie,
+                                                  VarLocation &varloc) {
+  if (!current_module_is_x86_64()) {
+    return false;
+  }
+
+  Dwarf_Addr entrypc;
+  if (func_entrypc(func, &entrypc) && pc != entrypc) {
+    cerr << "Cannot recover parameter " << symbol
+         << " from entry ABI because probe PC is not function entry" << endl;
+    return false;
+  }
+
+  if (function_return_may_use_x86_64_memory_pointer(func)) {
+    cerr << "Cannot recover parameter " << symbol
+         << " from ABI because function may use a hidden return pointer"
+         << endl;
+    return false;
+  }
+
+  Dwarf_Off target_off = dwarf_dieoffset(&vardie);
+  int gpr_idx = 0;
+  int stack_offset = 8;  // entry %rsp points at the return address.
+
+  Dwarf_Die child;
+  if (dwarf_child(func, &child) != 0) return false;
+
+  do {
+    if (dwarf_tag(&child) != DW_TAG_formal_parameter)
+      continue;
+
+    struct x86_64_abi_param abi_param;
+    if (!classify_x86_64_abi_param(&child, abi_param)) {
+      const char *name = dwarf_diename(&child);
+      cerr << "Cannot classify x86_64 ABI location for parameter "
+           << (name ?: "<anonymous>") << endl;
+      return false;
+    }
+
+    VarLocation candidate;
+    if (abi_param.cls == X86_64_ABI_INTEGER) {
+      if (gpr_idx < (int)(sizeof(x86_64_integer_arg_regs) /
+                         sizeof(x86_64_integer_arg_regs[0]))) {
+        candidate.reg = x86_64_integer_arg_regs[gpr_idx];
+        candidate.offset = 0;
+        candidate.stack = false;
+      } else {
+        candidate.reg = x86_64_dwarf_rsp;
+        candidate.offset = stack_offset;
+        candidate.stack = true;
+      }
+    } else {
+      stack_offset = align_up(stack_offset, 8);
+      candidate.reg = x86_64_dwarf_rsp;
+      candidate.offset = stack_offset;
+      candidate.stack = true;
+    }
+
+    const char *name = dwarf_diename(&child);
+    bool is_target = dwarf_dieoffset(&child) == target_off ||
+                     (name != NULL && symbol == name);
+    if (is_target) {
+      varloc = candidate;
+      cerr << "Recovered location for parameter " << symbol
+           << " from x86_64 SysV entry ABI: register " << varloc.reg
+           << " offset " << varloc.offset << " stack " << varloc.stack
+           << endl;
+      return true;
+    }
+
+    if (abi_param.cls == X86_64_ABI_INTEGER) {
+      if (gpr_idx < (int)(sizeof(x86_64_integer_arg_regs) /
+                         sizeof(x86_64_integer_arg_regs[0]))) {
+        ++gpr_idx;
+      } else {
+        stack_offset += 8;
+      }
+    } else {
+      stack_offset += abi_param.stack_size;
+    }
+  } while (dwarf_siblingof(&child, &child) == 0);
+
+  return false;
 }
 
 Dwarf_Attribute *DwarfParser::find_func_frame_base(
@@ -366,6 +764,33 @@ bool DwarfParser::find_class_member(Dwarf_Die *vardie, Dwarf_Die *typedie,
   return false;
 }
 
+bool DwarfParser::translate_data_member_location(Dwarf_Attribute *attr,
+                                                 Dwarf_Addr pc,
+                                                 int &offset) {
+  Dwarf_Word udata;
+  if (dwarf_formudata(attr, &udata) == 0) {
+    offset = (int)udata;
+    return true;
+  }
+
+  Dwarf_Sword sdata;
+  if (dwarf_formsdata(attr, &sdata) == 0) {
+    offset = (int)sdata;
+    return true;
+  }
+
+  Dwarf_Op *expr;
+  size_t len;
+  if (dwarf_getlocation_addr(attr, pc, &expr, &len, 1) != 1 || len == 0) {
+    return false;
+  }
+
+  VarLocation varloc;
+  if (!translate_expr(NULL, expr, pc, varloc)) return false;
+  offset = varloc.offset;
+  return true;
+}
+
 bool DwarfParser::translate_fields(Dwarf_Die *vardie, Dwarf_Die *typedie,
                                    Dwarf_Addr pc, vector<string> fields,
                                    vector<Field> &res) {
@@ -419,18 +844,12 @@ bool DwarfParser::translate_fields(Dwarf_Die *vardie, Dwarf_Die *typedie,
           clog << "failed to find member location for " << fields[i] << endl;
           return false;
         }
-        Dwarf_Op *expr;
-        size_t len;
-        if (dwarf_getlocation_addr(&attr, pc, &expr, &len, 1) != 1 || len == 0) {
+        int member_offset = 0;
+        if (!translate_data_member_location(&attr, pc, member_offset)) {
           clog << "failed to get location of attr for " << fields[i] << endl;
           return false;
         }
-        VarLocation varloc;
-        if (!translate_expr(NULL, expr, pc, varloc)) {
-          clog << "failed to translate location of " << fields[i] << endl;
-          return false;
-        }
-        res[i].offset = varloc.offset;
+        res[i].offset = member_offset;
 
         dwarf_die_type(vardie, typedie);
         ++i;
@@ -541,16 +960,35 @@ static int handle_function(Dwarf_Die *die, void *data) {
 
   // TODO need to check if the class name matches
   Dwarf_Addr pc;
+  bool pc_recovered_from_symbol = false;
   if (!dp->find_prologue(die, pc)) {
-    // LTO optimization will not generate the low_pc/high_pc/rangs for the abstract function
-    return 0;
+    // LTO optimization will not generate the low_pc/high_pc/ranges for the
+    // abstract function.  If the concrete function still exists in the ELF
+    // symbol table, the symbol value is the exact uprobe entry PC.
+    if (!dp->lookup_function_symbol_pc(fullname, pc)) {
+      return 0;
+    }
+    pc_recovered_from_symbol = true;
+  }
+  auto arr = dp->probes[fullname];
+  if (pc_recovered_from_symbol) {
+    for (int i = 0; i < (int)arr.size(); ++i) {
+      if (arr[i].empty()) continue;
+
+      Dwarf_Die vardie;
+      if (!dp->find_param(die, arr[i][0], vardie)) {
+        cerr << "Skipping " << fullname
+             << " after ELF symbol PC recovery because parameter "
+             << arr[i][0] << " is not available in this DIE" << endl;
+        return 0;
+      }
+    }
   }
   auto &func2pc = dp->mod_func2pc[dp->cur_mod_name];
   func2pc[fullname] = pc;
 
   auto &func2vf = dp->mod_func2vf[dp->cur_mod_name];
   auto &vf = func2vf[fullname];
-  auto arr = dp->probes[fullname];
   vf.resize(arr.size());
 
   for (int i = 0; i < (int)arr.size(); ++i) {
@@ -558,6 +996,14 @@ static int handle_function(Dwarf_Die *die, void *data) {
     Dwarf_Die vardie, typedie;
     VarLocation varloc;
     bool ok = dp->translate_param_location(die, varname, pc, vardie, varloc);
+    if (!ok) {
+      Dwarf_Die retry_vardie;
+      if (dp->find_param(die, varname, retry_vardie)) {
+        vardie = retry_vardie;
+        ok = dp->recover_param_location_from_abi(die, varname, pc, vardie,
+                                                 varloc);
+      }
+    }
     assert(ok);
     //printf("var %s location : register %d, offset %d, stack %d\n",
      //varname.c_str(), varloc.reg, varloc.offset, varloc.stack);
