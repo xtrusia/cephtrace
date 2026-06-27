@@ -48,7 +48,8 @@ enum x86_64_abi_class {
 
 struct x86_64_abi_param {
   enum x86_64_abi_class cls;
-  int stack_size;
+  int int_regs;    // INTEGER class: number of GPRs the argument consumes (1 or 2).
+  int stack_size;  // bytes the argument consumes when it lands on the stack.
 };
 
 static int align_up(int value, int align) {
@@ -79,110 +80,98 @@ static bool strip_type_modifiers(Dwarf_Die &die) {
   }
 }
 
-static bool param_type(Dwarf_Die *param, Dwarf_Die &type,
-                       const char *want_name, bool &name_matched) {
-  if (!die_type(param, type)) return false;
-  name_matched = false;
-
-  while (true) {
-    const char *name = dwarf_diename(&type);
-    if (name != NULL && strcmp(name, want_name) == 0)
-      name_matched = true;
-
-    switch (dwarf_tag(&type)) {
-      case DW_TAG_typedef:
-      case DW_TAG_const_type:
-      case DW_TAG_volatile_type:
-      case DW_TAG_restrict_type: {
-        Dwarf_Die referent;
-        if (!die_type(&type, referent)) return false;
-        type = referent;
-        break;
-      }
-      default:
-        return true;
-    }
-  }
+static bool param_type(Dwarf_Die *param, Dwarf_Die &type) {
+  return die_type(param, type) && strip_type_modifiers(type);
 }
 
-static bool data_member_offset(Dwarf_Die *member_die, int &offset) {
-  Dwarf_Attribute attr;
-  if (dwarf_attr_integrate(member_die, DW_AT_data_member_location, &attr) ==
-      NULL)
-    return false;
-
-  Dwarf_Word udata;
-  if (dwarf_formudata(&attr, &udata) == 0) {
-    offset = (int)udata;
-    return true;
-  }
-
-  Dwarf_Sword sdata;
-  if (dwarf_formsdata(&attr, &sdata) == 0) {
-    offset = (int)sdata;
-    return true;
-  }
-
+// Non-trivially-copyable Standard Library types and Ceph smart pointers,
+// matched by their unqualified DW_AT_name prefix.
+static bool type_name_is_nontrivial(const char *name) {
+  static const char *const prefixes[] = {
+      "basic_string", "vector<", "map<", "multimap<", "set<", "multiset<",
+      "list<", "deque<", "unordered_map<", "unordered_multimap<",
+      "unordered_set<", "unordered_multiset<", "unique_ptr<", "shared_ptr<",
+      "weak_ptr<", "intrusive_ptr<"};
+  for (const char *p : prefixes)
+    if (strncmp(name, p, strlen(p)) == 0) return true;
   return false;
 }
 
-static bool find_direct_member(Dwarf_Die *type, const char *want_name,
-                               Dwarf_Die &member_die, int &offset) {
+// A class is passed by invisible reference (one hidden pointer in a single INTEGER
+// register) when it is not trivially copyable for the purpose of calls.  This build
+// omits DW_AT_calling_convention, so detect it structurally: the type itself is a
+// non-trivial Standard Library type, or it transitively holds a member that is.
+static bool type_passed_by_invisible_reference(Dwarf_Die *type, int depth) {
+  if (depth > 8) return false;
+
+  const char *name = dwarf_diename(type);
+  if (name != NULL && type_name_is_nontrivial(name)) return true;
+
+  int tag = dwarf_tag(type);
+  if (tag != DW_TAG_structure_type && tag != DW_TAG_class_type &&
+      tag != DW_TAG_union_type)
+    return false;
+
   Dwarf_Die child;
   if (dwarf_child(type, &child) != 0) return false;
-
   do {
-    if (dwarf_tag(&child) != DW_TAG_member)
-      continue;
-
-    const char *name = dwarf_diename(&child);
-    if (name == NULL || strcmp(name, want_name) != 0)
-      continue;
-
-    if (!data_member_offset(&child, offset))
-      return false;
-
-    member_die = child;
-    return true;
+    if (dwarf_tag(&child) != DW_TAG_member) continue;
+    Dwarf_Die mt;
+    if (!die_type(&child, mt) || !strip_type_modifiers(mt)) continue;
+    if (type_passed_by_invisible_reference(&mt, depth + 1)) return true;
   } while (dwarf_siblingof(&child, &child) == 0);
-
   return false;
 }
 
-static bool osd_reqid_type_layout_ok(Dwarf_Die *type) {
-  int64_t bytes = dwarf_bytesize(type);
-  if (bytes != 32) return false;
+// A by-value aggregate of at most two eightbytes is passed in INTEGER registers
+// only when every scalar leaf is an integer-class member.  A floating-point leaf
+// would use the SSE class (XMM registers), which we do not model, so return false
+// and let the caller drop the function rather than misclassify.
+static bool aggregate_is_all_integer(Dwarf_Die *type, int depth) {
+  if (depth > 8) return false;
 
-  Dwarf_Die name_member, tid_member;
-  int name_offset, tid_offset;
-  if (!find_direct_member(type, "name", name_member, name_offset) ||
-      name_offset != 0)
-    return false;
-  if (!find_direct_member(type, "tid", tid_member, tid_offset) ||
-      tid_offset != 16)
-    return false;
-
-  Dwarf_Die name_type;
-  if (!die_type(&name_member, name_type)) return false;
-  if (!strip_type_modifiers(name_type)) return false;
-
-  Dwarf_Die num_member;
-  int num_offset;
-  return find_direct_member(&name_type, "_num", num_member, num_offset) &&
-         num_offset == 8;
+  Dwarf_Die child;
+  if (dwarf_child(type, &child) != 0) return true;
+  do {
+    if (dwarf_tag(&child) != DW_TAG_member) continue;
+    Dwarf_Die mt;
+    if (!die_type(&child, mt) || !strip_type_modifiers(mt)) return false;
+    switch (dwarf_tag(&mt)) {
+      case DW_TAG_base_type: {
+        Dwarf_Attribute enc_mem;
+        Dwarf_Attribute *enc = dwarf_attr_integrate(&mt, DW_AT_encoding, &enc_mem);
+        Dwarf_Word encoding;
+        if (enc == NULL || dwarf_formudata(enc, &encoding) != 0) return false;
+        if (encoding == DW_ATE_float || encoding == DW_ATE_complex_float)
+          return false;
+        break;
+      }
+      case DW_TAG_pointer_type:
+      case DW_TAG_enumeration_type:
+        break;
+      case DW_TAG_structure_type:
+      case DW_TAG_class_type:
+      case DW_TAG_union_type:
+        if (!aggregate_is_all_integer(&mt, depth + 1)) return false;
+        break;
+      default:
+        return false;
+    }
+  } while (dwarf_siblingof(&child, &child) == 0);
+  return true;
 }
 
 static bool classify_x86_64_abi_param(Dwarf_Die *param,
                                       struct x86_64_abi_param &abi_param) {
   Dwarf_Die type;
-  bool is_osd_reqid = false;
-  if (!param_type(param, type, "osd_reqid_t", is_osd_reqid)) return false;
+  if (!param_type(param, type)) return false;
 
   switch (dwarf_tag(&type)) {
     case DW_TAG_pointer_type:
     case DW_TAG_reference_type:
     case DW_TAG_rvalue_reference_type:
       abi_param.cls = X86_64_ABI_INTEGER;
+      abi_param.int_regs = 1;
       abi_param.stack_size = 8;
       return true;
 
@@ -191,6 +180,7 @@ static bool classify_x86_64_abi_param(Dwarf_Die *param,
       int64_t bytes = dwarf_bytesize(&type);
       if (bytes <= 0 || bytes > 8) return false;
       abi_param.cls = X86_64_ABI_INTEGER;
+      abi_param.int_regs = 1;
       abi_param.stack_size = 8;
       return true;
     }
@@ -201,13 +191,29 @@ static bool classify_x86_64_abi_param(Dwarf_Die *param,
       int64_t bytes = dwarf_bytesize(&type);
       if (bytes <= 0) return false;
 
-      // VarLocation can represent one base register or stack address only.
-      // Only recover Ceph's request id aggregate after proving the exact
-      // DWARF type and member layout used by osdtrace's JSON fields.
-      if (!is_osd_reqid || !osd_reqid_type_layout_ok(&type)) return false;
+      // Non-trivially-copyable types are passed as a hidden pointer (one register).
+      if (type_passed_by_invisible_reference(&type, 0)) {
+        abi_param.cls = X86_64_ABI_INTEGER;
+        abi_param.int_regs = 1;
+        abi_param.stack_size = 8;
+        return true;
+      }
 
-      abi_param.cls = X86_64_ABI_MEMORY;
-      abi_param.stack_size = align_up((int)bytes, 8);
+      // Trivially-copyable aggregate, passed by value.  More than two eightbytes
+      // goes to memory on the stack (spg_t is 24 bytes, osd_reqid_t 32).
+      if (bytes > 16) {
+        abi_param.cls = X86_64_ABI_MEMORY;
+        abi_param.int_regs = 0;
+        abi_param.stack_size = align_up((int)bytes, 8);
+        return true;
+      }
+
+      // One or two eightbytes: passed in INTEGER registers when every leaf is an
+      // integer-class member (eversion_t is 16 bytes, pg_shard_t 8).
+      if (!aggregate_is_all_integer(&type, 0)) return false;
+      abi_param.cls = X86_64_ABI_INTEGER;
+      abi_param.int_regs = (bytes > 8) ? 2 : 1;
+      abi_param.stack_size = abi_param.int_regs * 8;
       return true;
     }
 
@@ -498,7 +504,9 @@ bool DwarfParser::lookup_function_symbol_pc(string fullname, Dwarf_Addr &pc) {
         string base = demangled_function_base(demangled);
         if (raw_name != fullname && base != fullname) continue;
 
-        Dwarf_Addr sym_pc = sym.st_value + bias;
+        // func2pc stores DWARF addresses (dwarf_entrypc space, no load bias);
+        // the symbol table is in the same address space, so use st_value as-is.
+        Dwarf_Addr sym_pc = sym.st_value;
         if (found && found_pc != sym_pc) {
           cerr << "Ambiguous ELF symbols for function " << fullname << endl;
           return false;
@@ -560,23 +568,26 @@ bool DwarfParser::recover_param_location_from_abi(Dwarf_Die *func,
       return false;
     }
 
+    const int ngpr = (int)(sizeof(x86_64_integer_arg_regs) /
+                           sizeof(x86_64_integer_arg_regs[0]));
     VarLocation candidate;
-    if (abi_param.cls == X86_64_ABI_INTEGER) {
-      if (gpr_idx < (int)(sizeof(x86_64_integer_arg_regs) /
-                         sizeof(x86_64_integer_arg_regs[0]))) {
-        candidate.reg = x86_64_integer_arg_regs[gpr_idx];
-        candidate.offset = 0;
-        candidate.stack = false;
-      } else {
-        candidate.reg = x86_64_dwarf_rsp;
-        candidate.offset = stack_offset;
-        candidate.stack = true;
-      }
+    bool on_stack;
+    if (abi_param.cls == X86_64_ABI_INTEGER &&
+        gpr_idx + abi_param.int_regs <= ngpr) {
+      candidate.reg = x86_64_integer_arg_regs[gpr_idx];
+      candidate.offset = 0;
+      candidate.stack = false;
+      on_stack = false;
     } else {
+      // MEMORY, or an INTEGER argument whose eightbytes do not all fit in the
+      // remaining registers: the whole argument is passed on the stack, and no
+      // later argument backfills the skipped registers.
+      if (abi_param.cls == X86_64_ABI_INTEGER) gpr_idx = ngpr;
       stack_offset = align_up(stack_offset, 8);
       candidate.reg = x86_64_dwarf_rsp;
       candidate.offset = stack_offset;
       candidate.stack = true;
+      on_stack = true;
     }
 
     const char *name = dwarf_diename(&child);
@@ -591,16 +602,10 @@ bool DwarfParser::recover_param_location_from_abi(Dwarf_Die *func,
       return true;
     }
 
-    if (abi_param.cls == X86_64_ABI_INTEGER) {
-      if (gpr_idx < (int)(sizeof(x86_64_integer_arg_regs) /
-                         sizeof(x86_64_integer_arg_regs[0]))) {
-        ++gpr_idx;
-      } else {
-        stack_offset += 8;
-      }
-    } else {
+    if (on_stack)
       stack_offset += abi_param.stack_size;
-    }
+    else
+      gpr_idx += abi_param.int_regs;
   } while (dwarf_siblingof(&child, &child) == 0);
 
   return false;
@@ -1004,7 +1009,13 @@ static int handle_function(Dwarf_Die *die, void *data) {
                                                  varloc);
       }
     }
-    assert(ok);
+    if (!ok) {
+      cerr << "Dropping " << fullname << " because parameter " << varname
+           << " location could not be resolved" << endl;
+      func2pc.erase(fullname);
+      func2vf.erase(fullname);
+      return 0;
+    }
     //printf("var %s location : register %d, offset %d, stack %d\n",
      //varname.c_str(), varloc.reg, varloc.offset, varloc.stack);
     vf[i].varloc = varloc;
@@ -1013,7 +1024,13 @@ static int handle_function(Dwarf_Die *die, void *data) {
     dp->dwarf_die_type(&vardie, &typedie);
     vf[i].fields.resize(arr[i].size());
     ok = dp->translate_fields(&vardie, &typedie, pc, arr[i], vf[i].fields);
-    assert(ok);
+    if (!ok) {
+      cerr << "Dropping " << fullname << " because fields of parameter "
+           << varname << " could not be resolved" << endl;
+      func2pc.erase(fullname);
+      func2vf.erase(fullname);
+      return 0;
+    }
     for (int j = 1; j < (int)vf[i].fields.size(); ++j) {
        //printf("Field %s is at offset %d, defref %d\n", arr[i][j].c_str(),
        //vf[i].fields[j].offset, vf[i].fields[j].pointer);
