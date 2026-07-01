@@ -611,6 +611,94 @@ bool DwarfParser::recover_param_location_from_abi(Dwarf_Die *func,
   return false;
 }
 
+// LTO represents a function as an address-less abstract subprogram plus one or
+// more out-of-line concrete instances (with DW_AT_ranges and parameter location
+// lists) linked by DW_AT_abstract_origin.  Index the concretes by their abstract
+// origin so handle_function can read real locations from them when it reaches
+// the address-less abstract.
+void DwarfParser::index_concrete_instances(Dwarf *dw) {
+  Dwarf_Off offset = 0, next_offset;
+  size_t header_size;
+  Dwarf_Die cu_die;
+
+  while (dwarf_nextcu(dw, offset, &next_offset, &header_size, NULL, NULL,
+                      NULL) == 0) {
+    if (dwarf_offdie(dw, offset + header_size, &cu_die) != NULL) {
+      Dwarf_Die child;
+      if (dwarf_child(&cu_die, &child) == 0) {
+        do {
+          if (dwarf_tag(&child) != DW_TAG_subprogram) continue;
+          if (!dwarf_hasattr(&child, DW_AT_abstract_origin)) continue;
+          if (!dwarf_hasattr(&child, DW_AT_low_pc) &&
+              !dwarf_hasattr(&child, DW_AT_ranges))
+            continue;
+
+          Dwarf_Attribute ao_mem;
+          Dwarf_Attribute *ao_attr =
+              dwarf_attr_integrate(&child, DW_AT_abstract_origin, &ao_mem);
+          Dwarf_Die ao;
+          if (ao_attr != NULL && dwarf_formref_die(ao_attr, &ao) != NULL)
+            abstract_to_concrete[dwarf_dieoffset(&ao)].push_back(child);
+        } while (dwarf_siblingof(&child, &child) == 0);
+      }
+    }
+    offset = next_offset;
+  }
+}
+
+// LTO can emit several concrete instances (and cold-split fragments) for one
+// abstract function, so pick the one whose address ranges contain the entry PC.
+bool DwarfParser::select_concrete_instance(Dwarf_Off abstract_off, Dwarf_Addr pc,
+                                           Dwarf_Die &out) {
+  auto it = abstract_to_concrete.find(abstract_off);
+  if (it == abstract_to_concrete.end() || it->second.empty()) return false;
+  for (Dwarf_Die &c : it->second) {
+    if (dwarf_haspc(&c, pc) == 1) {
+      out = c;
+      return true;
+    }
+  }
+  out = it->second.front();
+  return true;
+}
+
+// Read a parameter's location from a concrete instance.  Its formal_parameter
+// children carry the real DW_AT_location (a loclist that, at the entry PC,
+// resolves to the incoming ABI slot); dwarf_diename resolves their name through
+// DW_AT_abstract_origin.
+bool DwarfParser::find_concrete_param_location(Dwarf_Die *concrete,
+                                               string symbol, Dwarf_Addr pc,
+                                               Dwarf_Die &vardie,
+                                               VarLocation &varloc) {
+  Dwarf_Die child;
+  if (dwarf_child(concrete, &child) != 0) return false;
+
+  do {
+    if (dwarf_tag(&child) != DW_TAG_formal_parameter) continue;
+
+    const char *name = dwarf_diename(&child);
+    if (name == NULL || symbol != name) continue;
+
+    Dwarf_Attribute loc_mem;
+    Dwarf_Attribute *loc = dwarf_attr_integrate(&child, DW_AT_location, &loc_mem);
+    if (loc == NULL) return false;
+
+    Dwarf_Op *expr;
+    size_t len;
+    if (dwarf_getlocation_addr(loc, pc, &expr, &len, 1) != 1 || len == 0)
+      return false;
+
+    Dwarf_Attribute fb_mem;
+    Dwarf_Attribute *fb = find_func_frame_base(concrete, &fb_mem);
+    if (!translate_expr(fb, expr, pc, varloc)) return false;
+
+    vardie = child;
+    return true;
+  } while (dwarf_siblingof(&child, &child) == 0);
+
+  return false;
+}
+
 Dwarf_Attribute *DwarfParser::find_func_frame_base(
     Dwarf_Die *func, Dwarf_Attribute *fb_attr_mem) {
   assert(dwarf_tag(func) == DW_TAG_subprogram);
@@ -966,14 +1054,23 @@ static int handle_function(Dwarf_Die *die, void *data) {
   // TODO need to check if the class name matches
   Dwarf_Addr pc;
   bool pc_recovered_from_symbol = false;
+  bool use_concrete = false;
+  Dwarf_Die concrete;
   if (!dp->find_prologue(die, pc)) {
-    // LTO optimization will not generate the low_pc/high_pc/ranges for the
-    // abstract function.  If the concrete function still exists in the ELF
-    // symbol table, the symbol value is the exact uprobe entry PC.
+    // LTO leaves the abstract instance without addresses.  The ELF symbol value
+    // is the real entry PC (the uprobe point); read the concrete instance's
+    // location lists at it, where the frame base (call_frame_cfa) is rsp+8 so
+    // they resolve to the incoming ABI slots.  Pick the concrete whose ranges
+    // contain that PC; fall back to ABI reconstruction when none exists.
     if (!dp->lookup_function_symbol_pc(fullname, pc)) {
       return 0;
     }
-    pc_recovered_from_symbol = true;
+    if (dp->select_concrete_instance(dwarf_dieoffset(&func_abstract), pc,
+                                     concrete)) {
+      use_concrete = true;
+    } else {
+      pc_recovered_from_symbol = true;
+    }
   }
   auto arr = dp->probes[fullname];
   if (pc_recovered_from_symbol) {
@@ -1000,8 +1097,14 @@ static int handle_function(Dwarf_Die *die, void *data) {
     string varname = arr[i][0];
     Dwarf_Die vardie, typedie;
     VarLocation varloc;
-    bool ok = dp->translate_param_location(die, varname, pc, vardie, varloc);
+    bool ok = use_concrete
+                  ? dp->find_concrete_param_location(&concrete, varname, pc,
+                                                     vardie, varloc)
+                  : dp->translate_param_location(die, varname, pc, vardie,
+                                                 varloc);
     if (!ok) {
+      // The concrete location list (or the abstract's own location) may have no
+      // entry at the entry PC; reconstruct the incoming ABI slot in that case.
       Dwarf_Die retry_vardie;
       if (dp->find_param(die, varname, retry_vardie)) {
         vardie = retry_vardie;
@@ -1235,6 +1338,9 @@ static int handle_module(Dwfl_Module *dwflmod, void **userdata,
   Dwarf_Off next_offset;
   size_t header_size;
   Dwarf_Die cu_die;
+
+  dp->abstract_to_concrete.clear();
+  dp->index_concrete_instances(dwarf);
 
   while (dwarf_nextcu(dwarf, offset, &next_offset, &header_size, nullptr,
                       nullptr, nullptr) == 0) {

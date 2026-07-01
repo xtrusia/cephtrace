@@ -39,6 +39,11 @@ class DwarfParser {
   typedef std::map<std::string, std::vector<std::vector<std::string>>> probes_t;
   mod_func2vf_t mod_func2vf;
   mod_func2pc_t mod_func2pc;
+  // LTO emits an address-less abstract subprogram plus one or more out-of-line
+  // concrete instances (with ranges and parameter location lists) linked by
+  // DW_AT_abstract_origin.  Maps the abstract DIE offset to its concrete DIEs so
+  // handle_function can read the real locations instead of reconstructing them.
+  std::map<Dwarf_Off, std::vector<Dwarf_Die>> abstract_to_concrete;
   // basename → full path on disk for every add_module() call.  Lets
   // export_to_json() read each module's ELF build-id without the caller
   // needing to re-derive the path.
@@ -74,6 +79,10 @@ class DwarfParser {
   Dwarf_Attribute *find_func_frame_base(Dwarf_Die *, Dwarf_Attribute *);
   bool translate_param_location(Dwarf_Die *, std::string, Dwarf_Addr,
                                 Dwarf_Die &, VarLocation &);
+  bool find_concrete_param_location(Dwarf_Die *, std::string, Dwarf_Addr,
+                                    Dwarf_Die &, VarLocation &);
+  void index_concrete_instances(Dwarf *);
+  bool select_concrete_instance(Dwarf_Off, Dwarf_Addr, Dwarf_Die &);
   bool recover_param_location_from_abi(Dwarf_Die *, std::string, Dwarf_Addr,
                                        Dwarf_Die &, VarLocation &);
   bool translate_data_member_location(Dwarf_Attribute *, Dwarf_Addr, int &);
