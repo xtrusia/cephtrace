@@ -26,7 +26,7 @@
 #include "version_utils.h"
 
 #define CEPH_PG_MAX_SIZE 8
-#define CEPH_OID_INLINE_LEN 24
+#define CEPH_OID_INLINE_LEN 52
 #define CEPH_OSD_MAX_OPS 3
 
 // MDS tracing constants (must match eBPF definitions)
@@ -196,13 +196,17 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
         snprintf(acting_set, sizeof(acting_set), "[%u]", event->primary_osd);
     }
 
-    // Format object name, ensuring it's null-terminated
-    char object_name[CEPH_OID_INLINE_LEN + 1];
-    if (event->object_name_len > 0 && event->object_name_len < CEPH_OID_INLINE_LEN) {
+    // Format object name, ensuring it's null-terminated. object_name_len is the
+    // true length, so anything the buffer couldn't hold is marked as truncated.
+    char object_name[CEPH_OID_INLINE_LEN + 4];
+    if (event->object_name_len == 0) {
+        strcpy(object_name, "<unknown>");
+    } else if (event->object_name_len < CEPH_OID_INLINE_LEN) {
         memcpy(object_name, event->object_name, event->object_name_len);
         object_name[event->object_name_len] = '\0';
     } else {
-        strcpy(object_name, "<unknown>");
+        memcpy(object_name, event->object_name, CEPH_OID_INLINE_LEN - 1);
+        strcpy(object_name + CEPH_OID_INLINE_LEN - 1, "...");
     }
 
     // Determine operation type string
@@ -220,7 +224,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
     // Format ops array (now includes offset/length for extent operations)
     std::string ops_str = format_ops(event);
 
-    printf("%-8s %-8u %-12s %-10llu %-16llu %-8llu %-8u %-6s %-20s %-32s %-8u %-30s %lluμs\n",
+    printf("%-8s %-8u %-12s %-10llu %-16llu %-8llu %-8u %-6s %-20s %-54s %-8u %-30s %lluμs\n",
            ts, event->pid, event->comm, event->client_id, event->tid, event->pool_id, event->pg_id, op_str, acting_set,
            object_name, event->attempts, ops_str.c_str(), event->latency_us);
 
@@ -465,7 +469,7 @@ int main(int argc, char **argv)
     // Print appropriate headers based on mode
     if (mode == MODE_OSD) {
         printf("Tracing Ceph kernel OSD requests... Press Ctrl+C to stop.\n");
-        printf("%-8s %-8s %-12s %-10s %-16s %-8s %-8s %-6s %-20s %-32s %-8s %-30s %-12s\n",
+        printf("%-8s %-8s %-12s %-10s %-16s %-8s %-8s %-6s %-20s %-54s %-8s %-30s %-12s\n",
                "TIME", "PID", "COMMAND", "CLIENT_ID", "TID", "POOL", "PG", "OP", "ACTING_SET", "OBJECT", "ATTEMPTS", "OPS", "LATENCY(us)");
     } else if (mode == MODE_MDS) {
         printf("Tracing Ceph kernel MDS requests... Press Ctrl+C to stop.\n");

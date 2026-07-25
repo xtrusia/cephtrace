@@ -7,7 +7,7 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 #define MAX_REQUESTS 1024
 #define CEPH_PG_MAX_SIZE 8
-#define CEPH_OID_INLINE_LEN 24
+#define CEPH_OID_INLINE_LEN 52
 #define CEPH_OSD_MAX_OPS 3
 
 // MDS tracing constants
@@ -191,16 +191,18 @@ struct {
     __uint(max_entries, 256 * 1024);
 } mds_rb SEC(".maps");
 
+// Kept out of the helpers below so the events never land on the BPF stack
+static struct kernel_trace_event zero_event = {};
+static struct mds_trace_event zero_mds_event = {};
+
 // Helper function to initialize kernel trace event in map (avoids stack overflow)
 static __always_inline void initialize_kernel_trace_event(struct request_key *key) {
-    struct kernel_trace_event zero_event = {};
     bpf_map_update_elem(&pending_requests, key, &zero_event, BPF_ANY);
 }
 
 // Helper function to initialize MDS trace event in map (avoids stack overflow)
 static __always_inline void initialize_mds_trace_event(struct mds_request_key *key) {
-    struct mds_trace_event zero_event = {};
-    bpf_map_update_elem(&pending_mds_requests, key, &zero_event, BPF_ANY);
+    bpf_map_update_elem(&pending_mds_requests, key, &zero_mds_event, BPF_ANY);
 }
 
 SEC("kprobe/send_request")
@@ -289,13 +291,19 @@ int trace_send_request(struct pt_regs *ctx)
 
     // Read target object ID fields directly
     int name_len;
-    if (bpf_core_read(&name_len, sizeof(name_len), &target->target_oid.name_len) == 0) {
-        info->object_name_len = name_len;
-        if (info->object_name_len > CEPH_OID_INLINE_LEN - 1)
-            info->object_name_len = CEPH_OID_INLINE_LEN - 1;
+    if (bpf_core_read(&name_len, sizeof(name_len), &target->target_oid.name_len) == 0 && name_len > 0) {
+        const char *name_ptr = NULL;
+        __u32 copy_len = name_len;
 
-        // Try to read the inline name first (most common case)
-        bpf_core_read_str(info->object_name, info->object_name_len + 1, &target->target_oid.inline_name);
+        // Report the true length so userspace can tell a truncated name apart
+        info->object_name_len = name_len;
+        if (copy_len > CEPH_OID_INLINE_LEN - 1)
+            copy_len = CEPH_OID_INLINE_LEN - 1;
+
+        // oid->name points at inline_name while the name fits inline, and at a
+        // separately allocated buffer once it no longer does
+        if (bpf_core_read(&name_ptr, sizeof(name_ptr), &target->target_oid.name) == 0 && name_ptr)
+            bpf_core_read_str(info->object_name, copy_len + 1, name_ptr);
     }
 
     // Read pool and PG information from target->spgid.pgid (calculated PG)
